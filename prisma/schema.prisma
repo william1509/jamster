@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+
+model Game {
+  id String @id @default(cuid())
+  code String @unique
+  hostId String
+  status String @default("LOBBY")
+  roundNumber Int @default(0)
+  maxRounds Int @default(10)
+  players Player[]
+  rounds Round[]
+  createdAt DateTime @default(now())
+}
+model Player {
+  id String @id
+  gameId String
+  name String
+  score Int @default(0)
+  connected Boolean @default(true)
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  answers Answer[]
+  @@unique([gameId, id])
+}
+model Round {
+  id String @id @default(cuid())
+  gameId String
+  number Int
+  songId String
+  status String @default("PLAYING")
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [id])
+  answers Answer[]
+  @@unique([gameId, number])
+}
+model Song {
+  id String @id
+  provider String
+  providerTrackId String?
+  spotifyUrl String?
+  title String
+  artist String
+  album String
+  releaseYear Int
+  artworkUrl String?
+  duration Int?
+  popularity Int?
+  rounds Round[]
+  playlists PlaylistSong[]
+}
+model Playlist {
+  id String @id @default(cuid())
+  name String
+  songs PlaylistSong[]
+  createdAt DateTime @default(now())
+}
+model PlaylistSong {
+  playlistId String
+  songId String
+  position Int
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [id], onDelete: Cascade)
+  @@id([playlistId, songId])
+  @@index([playlistId, position])
+}
+model Answer {
+  id String @id @default(cuid())
+  roundId String
+  playerId String
+  title String
+  artist String
+  year Int?
+  points Int @default(0)
+  round Round @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  @@unique([roundId, playerId])
+}
+
