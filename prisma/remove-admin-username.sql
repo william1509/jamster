@@ -1,0 +1,1 @@
+ALTER TABLE IF EXISTS "AdminAccount" DROP COLUMN IF EXISTS "username";

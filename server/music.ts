@@ -2,6 +2,7 @@ export type Song = {
   id: string;
   provider: "mock" | "jellyfin" | "spotify";
   providerTrackId?: string;
+  jellyfinTrackId?: string;
   spotifyUrl?: string;
   title: string;
   artist: string;
@@ -55,7 +56,7 @@ export class JellyfinMusicProvider implements MusicProvider {
     this.password = password;
   }
   private headers(authenticated = true) {
-    const identity = 'MediaBrowser Client="Side A", Device="Side A Server", DeviceId="sidea-server", Version="1.0.0"';
+    const identity = 'MediaBrowser Client="Jamster", Device="Jamster Server", DeviceId="jamster-server", Version="1.0.0"';
     return {
       "Content-Type": "application/json",
       Authorization: authenticated && this.token ? `${identity}, Token="${this.token}"` : identity,
@@ -106,6 +107,24 @@ export class JellyfinMusicProvider implements MusicProvider {
     const data = await response.json() as { Items?: JellyfinPlaylistItem[] };
     return (data.Items || []).map(({ Id, Name, ChildCount }) => ({ id: Id, name: Name, trackCount: ChildCount || 0 }));
   }
+  async listAudioSongs(maxItems = 50_000) {
+    if (!this.token) throw new Error("Connect Jellyfin first.");
+    const songs: Song[] = [];
+    const pageSize = 500;
+    for (let startIndex = 0; startIndex < maxItems; startIndex += pageSize) {
+      const params = new URLSearchParams({
+        IncludeItemTypes: "Audio", Recursive: "true", Fields: "ProductionYear,DateCreated,Album,Artists,RunTimeTicks",
+        StartIndex: String(startIndex), Limit: String(pageSize), UserId: this.userId,
+      });
+      const response = await fetch(`${this.baseUrl}/Users/${encodeURIComponent(this.userId)}/Items?${params}`, { headers: this.headers() });
+      if (!response.ok) throw new Error(`Jellyfin library scan failed (${response.status}).`);
+      const data = await response.json() as { Items?: JellyfinItem[]; TotalRecordCount?: number };
+      const items = data.Items || [];
+      songs.push(...items.map((item) => this.toSong(item)));
+      if (items.length < pageSize || (data.TotalRecordCount !== undefined && startIndex + items.length >= data.TotalRecordCount)) return songs;
+    }
+    throw new Error(`Jellyfin library scan stopped at ${maxItems.toLocaleString()} items. Use manual matching for this large library.`);
+  }
   async getPlaylistSongs(playlistId: string) {
     if (!this.token) throw new Error("Connect Jellyfin first.");
     const songs: Song[] = [];
@@ -139,8 +158,9 @@ export class JellyfinMusicProvider implements MusicProvider {
     return song;
   }
   getStreamUrl(song: Song) {
-    if (song.provider !== "jellyfin" || !song.providerTrackId) return undefined;
-    const url = new URL(`${this.baseUrl}/Audio/${encodeURIComponent(song.providerTrackId)}/stream`);
+    const itemId = song.jellyfinTrackId || (song.provider === "jellyfin" ? song.providerTrackId : undefined);
+    if (!itemId) return undefined;
+    const url = new URL(`${this.baseUrl}/Audio/${encodeURIComponent(itemId)}/stream`);
     // HTML media elements cannot set auth headers; Jellyfin accepts its API token as api_key.
     url.searchParams.set("api_key", this.token);
     return url.toString();

@@ -43,6 +43,7 @@ model Song {
   id String @id
   provider String
   providerTrackId String?
+  jellyfinTrackId String?
   spotifyUrl String?
   title String
   artist String
@@ -80,5 +81,12 @@ model Answer {
   round Round @relation(fields: [roundId], references: [id], onDelete: Cascade)
   player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
   @@unique([roundId, playerId])
+}
+
+model AdminAccount {
+  id String @id
+  passwordHash String
+  passwordSalt String
+  createdAt DateTime @default(now())
 }
 

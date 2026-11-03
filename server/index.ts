@@ -1,17 +1,18 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
+import helmet from "helmet";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Server } from "socket.io";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { JellyfinMusicProvider, MockMusicProvider, type MusicProvider, type Song } from "./music";
 import { scoreAnswer } from "./scoring";
 
-type Player = { id: string; name: string; score: number; connected: boolean };
+type Player = { id: string; sessionToken: string; name: string; score: number; connected: boolean };
 type Answer = { playerId: string; title: string; artist: string; year: number | null; points: number };
 type Playlist = { id: string; name: string; songs: Song[] };
 type Game = {
@@ -37,8 +38,26 @@ type Game = {
 };
 const games = new Map<string, Game>();
 const prisma = new PrismaClient();
+const adminSessions = new Map<string, number>();
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 type SpotifyTokens = { accessToken: string; refreshToken: string; expiresAt: number };
 const spotifyTokens = new Map<string, SpotifyTokens>();
+const libraryAdminId = "library-admin";
+const passwordHash = (password: string, salt: string) => new Promise<Buffer>((resolve, reject) => {
+  scrypt(password, salt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, key) => {
+    if (error) reject(error);
+    else resolve(key as Buffer);
+  });
+});
+const adminPasswordSchema = z.string().min(12).max(128);
+const adminSetupSecret = process.env.ADMIN_SETUP_SECRET || "";
+const configuredAdminPassword = process.env.ADMIN_PASSWORD || "";
+const adminSetupSecretMatches = (candidate: unknown) => {
+  if (adminSetupSecret.length < 32 || typeof candidate !== "string") return false;
+  const expected = Buffer.from(adminSetupSecret);
+  const provided = Buffer.from(candidate);
+  return expected.length === provided.length && timingSafeEqual(expected, provided);
+};
 const spotifyAuthStates = new Map<string, { verifier: string; hostId: string; origin: string; expiresAt: number }>();
 const spotifyClientId = process.env.SPOTIFY_CLIENT_ID || "";
 const spotifyRedirectUri = process.env.SPOTIFY_REDIRECT_URI || `http://localhost:${process.env.PORT || 3001}/api/spotify/callback`;
@@ -68,7 +87,7 @@ const spotifyApi = async <T,>(hostId: string, url: string): Promise<T> => {
     if (response.status === 401) spotifyTokens.delete(hostId);
     if (response.status === 429) throw new Error(`Spotify rate limit reached. Try again in ${response.headers.get("retry-after") || "a few"} seconds.`);
     throw new Error(response.status === 403
-      ? "Spotify could not access that playlist. It must be owned by or shared with the connected Spotify account."
+      ? "Spotify denied access to this playlist's tracks. The connected account must own the playlist or be a collaborator; a playlist being public or followed is not enough."
       : `Spotify playlist request failed (${response.status}).`);
   }
   return await response.json() as T;
@@ -121,19 +140,28 @@ const playlistStorageError = (error: unknown) => {
     return "Playlist tables are missing. Start PostgreSQL, then run `npm run db:push`.";
   return message;
 };
+const normalizeMatchText = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const configuredJellyfin = Boolean(process.env.JELLYFIN_URL && process.env.JELLYFIN_USERNAME && process.env.JELLYFIN_PASSWORD);
 const jellyfinProvider = configuredJellyfin
   ? new JellyfinMusicProvider(process.env.JELLYFIN_URL!, process.env.JELLYFIN_USERNAME!, process.env.JELLYFIN_PASSWORD!)
   : undefined;
 let jellyfinReady = false;
+const hasJellyfinAudio = (song: Song) => Boolean(song.jellyfinTrackId || (song.provider === "jellyfin" && song.providerTrackId));
 const streamTickets = new Map<string, { url: string; expiresAt: number }>();
 if (jellyfinProvider) {
   void jellyfinProvider.connect().then(() => { jellyfinReady = true; console.log("Jellyfin connected"); })
     .catch((error: unknown) => console.error("Jellyfin connection failed:", (error as Error).message));
 }
+const trustedProxyAddresses = new Set((process.env.TRUSTED_PROXY_ADDRESSES || "").split(",").map((value) => value.trim()).filter((value) => isIP(value)));
+const normalizedAddress = (address: string) => address.startsWith("::ffff:") ? address.slice(7) : address;
+const isTrustedProxy = (address: string | undefined) => Boolean(address && (trustedProxyAddresses.has(address) || trustedProxyAddresses.has(normalizedAddress(address))));
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable("x-powered-by");
+app.use(helmet({
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  contentSecurityPolicy: { directives: { "style-src": ["'self'", "'unsafe-inline'"] } },
+}));
+app.use(express.json({ limit: "32kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/spotify/callback", async (req, res) => {
   const state = typeof req.query.state === "string" ? req.query.state : "";
@@ -162,7 +190,9 @@ app.get("/api/spotify/callback", async (req, res) => {
   try { targetOrigin = pending ? new URL(pending.origin).origin : ""; } catch { /* Invalid opener origins are never used as message targets. */ }
   if (!targetOrigin) return res.status(400).send("Spotify authorization could not be matched to the app. Close this window and try again.");
   const payload = JSON.stringify({ type: "spotify-auth-complete", ok, message }).replace(/</g, "\\u003c");
-  res.type("html").send(`<!doctype html><meta charset="utf-8"><title>Spotify connection</title><p>${ok ? "Connected." : "Connection failed."} This window should close automatically.</p><script>window.opener?.postMessage(${payload},${JSON.stringify(targetOrigin)});window.close()</script>`);
+  const nonce = randomBytes(16).toString("base64");
+  res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`);
+  res.type("html").send(`<!doctype html><meta charset="utf-8"><title>Spotify connection</title><p>${ok ? "Connected." : "Connection failed."} This window should close automatically.</p><script nonce="${nonce}">window.opener?.postMessage(${payload},${JSON.stringify(targetOrigin)});window.close()</script>`);
 });
 app.get("/api/music/stream/:ticket", async (req, res) => {
   const stream = streamTickets.get(req.params.ticket);
@@ -197,10 +227,51 @@ app.get("*", (_req, res, next) => {
   res.sendFile("index.html", { root: "dist" }, (error) => { if (error) next(); });
 });
 const http = createServer(app),
-  io = new Server(http, { cors: { origin: true, credentials: true } });
+  io = new Server(http, {
+    maxHttpBufferSize: 64 * 1024,
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      const host = req.headers.host;
+      const forwardedProtoHeader = req.headers["x-forwarded-proto"];
+      const forwardedProto = (Array.isArray(forwardedProtoHeader) ? forwardedProtoHeader[0] : forwardedProtoHeader?.split(",")[0])?.trim();
+      const protocol = isTrustedProxy(req.socket.remoteAddress) && forwardedProto
+        ? forwardedProto
+        : ((req.socket as typeof req.socket & { encrypted?: boolean }).encrypted ? "https" : "http");
+      callback(null, !origin || (Boolean(host) && origin === `${protocol}://${host}`));
+    },
+  });
+const joinAttemptsByAddress = new Map<string, { windowStarted: number; count: number }>();
+const gameCreationAttemptsByAddress = new Map<string, { windowStarted: number; count: number }>();
+const adminAuthAttemptsByAddress = new Map<string, { windowStarted: number; count: number }>();
+let lastRateLimitCleanup = 0;
+const clientAddress = (socket: import("socket.io").Socket) => {
+  const remoteAddress = socket.conn.remoteAddress;
+  if (!remoteAddress || !isTrustedProxy(remoteAddress)) return remoteAddress || socket.handshake.address;
+  // Configure the trusted proxy to overwrite X-Forwarded-For with the client IP.
+  const forwardedFor = socket.handshake.headers["x-forwarded-for"];
+  const candidate = typeof forwardedFor === "string" ? forwardedFor.split(",")[0].trim() : "";
+  return isIP(candidate) ? candidate : remoteAddress;
+};
+const incrementLimit = (store: Map<string, { windowStarted: number; count: number }>, address: string, limit: number, windowMs = 60_000) => {
+  const now = Date.now();
+  // Expire old entries and cap the number of distinct address keys to bound memory use.
+  if (now - lastRateLimitCleanup >= windowMs) {
+    for (const counters of [joinAttemptsByAddress, gameCreationAttemptsByAddress, adminAuthAttemptsByAddress])
+      for (const [key, entry] of counters) if (now - entry.windowStarted >= windowMs) counters.delete(key);
+    lastRateLimitCleanup = now;
+  }
+  let entry = store.get(address);
+  if (!entry) {
+    if (store.size >= 10_000) store.delete(store.keys().next().value!);
+    entry = { windowStarted: now, count: 0 };
+    store.set(address, entry);
+  }
+  if (now - entry.windowStarted >= windowMs) { entry.windowStarted = now; entry.count = 0; }
+  return ++entry.count <= limit;
+};
 const code = () => {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  return [...randomBytes(4)].map((b) => chars[b % chars.length]).join("");
+  return [...randomBytes(6)].map((b) => chars[b % chars.length]).join("");
 };
 const safeGame = (g: Game, reveal = false) => ({
   code: g.code,
@@ -211,7 +282,7 @@ const safeGame = (g: Game, reveal = false) => ({
   answered: g.answers.size,
   answeredPlayers: [...g.answers.keys()],
   song: reveal ? g.currentSong : undefined,
-  playlists: g.playlists.map((p) => ({ id: p.id, name: p.name, trackCount: p.songs.length })),
+  playlists: g.playlists.map((p) => ({ id: p.id, name: p.name, trackCount: p.songs.length, jellyfinTrackCount: p.songs.filter(hasJellyfinAudio).length })),
   selectedPlaylistId: g.gamePlaylistId || g.selectedPlaylistId,
   roundEndsAt: g.roundEndsAt,
   roundTimeRemainingMs: g.roundEndsAt ? Math.max(0, g.roundEndsAt - Date.now()) : g.roundRemainingMs,
@@ -226,7 +297,7 @@ const codeSchema = z
     .string()
     .trim()
     .toUpperCase()
-    .regex(/^[A-Z2-9]{4}$/),
+    .regex(/^[A-Z2-9]{6}$/),
   nameSchema = z.string().trim().min(1).max(20),
   answerSchema = z.object({
     title: z.string().trim().max(100),
@@ -235,7 +306,92 @@ const codeSchema = z
   });
 io.on("connection", (socket) => {
   let identity: { game: Game; playerId: string; host: boolean } | undefined;
+  let adminAuthenticated = false;
+  let adminSessionToken = "";
+  const issueAdminSession = () => {
+    const now = Date.now();
+    for (const [token, expiresAt] of adminSessions) if (expiresAt <= now) adminSessions.delete(token);
+    adminSessionToken = randomBytes(32).toString("hex");
+    adminSessions.set(adminSessionToken, now + ADMIN_SESSION_TTL_MS);
+    return adminSessionToken;
+  };
+  let eventWindowStarted = Date.now();
+  let eventCount = 0;
+  socket.use((packet, next) => {
+    const now = Date.now();
+    if (now - eventWindowStarted >= 10_000) { eventWindowStarted = now; eventCount = 0; }
+    if (++eventCount > 120) return next(new Error("Too many requests. Please slow down."));
+    next();
+  });
+  const requireLibraryAdmin = () => {
+    if (!adminAuthenticated) throw new Error("Log in with the admin account to manage playlists.");
+  };
+  const allowAdminAuthAttempt = () => {
+    return incrementLimit(adminAuthAttemptsByAddress, clientAddress(socket), 10);
+  };
+  socket.on("admin-setup-status", async (_payload: unknown, cb: (x: any) => void) => {
+    try { cb({ setupRequired: !(await prisma.adminAccount.findUnique({ where: { id: "primary" } })), setupEnabled: adminSetupSecret.length >= 32 }); }
+    catch { cb({ error: "Could not check admin account setup." }); }
+  });
+  socket.on("admin-create", async (payload: { password?: string; setupSecret?: string }, cb: (x: any) => void) => {
+    if (!allowAdminAuthAttempt()) return cb({ error: "Too many admin attempts. Wait a minute and try again." });
+    if (!adminSetupSecretMatches(payload?.setupSecret)) return cb({ error: "Admin setup is disabled or the one-time setup secret is incorrect." });
+    const password = adminPasswordSchema.safeParse(payload?.password);
+    if (!password.success) return cb({ error: "Use an admin password of at least 12 characters." });
+    try {
+      if (await prisma.adminAccount.findUnique({ where: { id: "primary" } }))
+        return cb({ error: "Admin setup is already complete. Log in instead." });
+      const salt = randomBytes(16).toString("hex");
+      const hash = await passwordHash(password.data, salt);
+      await prisma.adminAccount.create({ data: { id: "primary", passwordHash: hash.toString("hex"), passwordSalt: salt } });
+      adminAuthenticated = true;
+      cb({ ok: true, sessionToken: issueAdminSession() });
+    } catch (error) {
+      if ((error as { code?: string }).code === "P2002") return cb({ error: "Admin setup was just completed. Log in instead." });
+      cb({ error: "Could not create the admin account." });
+    }
+  });
+  socket.on("admin-login", async (payload: { password?: string }, cb: (x: any) => void) => {
+    if (!allowAdminAuthAttempt()) return cb({ error: "Too many admin attempts. Wait a minute and try again." });
+    const password = adminPasswordSchema.safeParse(payload?.password);
+    if (!password.success) return cb({ error: "Invalid admin password." });
+    try {
+      const account = await prisma.adminAccount.findUnique({ where: { id: "primary" } });
+      if (!account) return cb({ error: "Invalid admin password." });
+      const passwordMatches = configuredAdminPassword.length >= 12
+        ? (() => {
+          const expected = Buffer.from(configuredAdminPassword);
+          const provided = Buffer.from(password.data);
+          return expected.length === provided.length && timingSafeEqual(expected, provided);
+        })()
+        : timingSafeEqual(await passwordHash(password.data, account.passwordSalt), Buffer.from(account.passwordHash, "hex"));
+      if (!passwordMatches)
+        return cb({ error: "Invalid admin password." });
+      adminAuthenticated = true;
+      cb({ ok: true, sessionToken: issueAdminSession() });
+    } catch { cb({ error: "Could not verify the admin account." }); }
+  });
+  socket.on("admin-resume", (payload: { sessionToken?: string }, cb: (x: any) => void) => {
+    const token = typeof payload?.sessionToken === "string" ? payload.sessionToken : "";
+    const expiresAt = adminSessions.get(token);
+    if (!token || !expiresAt || expiresAt <= Date.now()) {
+      if (token) adminSessions.delete(token);
+      return cb({ ok: false });
+    }
+    adminAuthenticated = true;
+    adminSessionToken = token;
+    adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+    cb({ ok: true });
+  });
+  socket.on("admin-logout", (_payload: unknown, cb: (x: any) => void) => {
+    adminAuthenticated = false;
+    if (adminSessionToken) adminSessions.delete(adminSessionToken);
+    adminSessionToken = "";
+    cb({ ok: true });
+  });
   socket.on("create-game", async (payload: { name?: string }, cb: (x: any) => void) => {
+    if (!adminAuthenticated) return cb({ error: "Log in with the admin account before hosting a game." });
+    if (!incrementLimit(gameCreationAttemptsByAddress, clientAddress(socket), 10)) return cb({ error: "Too many game creation attempts. Wait a minute and try again." });
     try {
       const name = nameSchema.safeParse(payload?.name ?? "Host");
       if (!name.success) return cb({ error: "Choose a name up to 20 characters." });
@@ -245,12 +401,12 @@ io.on("connection", (socket) => {
       });
       let c = code();
       while (games.has(c)) c = code();
-      const id = randomUUID(),
+      const id = randomUUID(), sessionToken = randomBytes(32).toString("hex"),
         g: Game = {
           code: c,
           hostId: id,
           status: "LOBBY",
-          players: new Map([[id, { id, name: name.data, score: 0, connected: true }]]),
+          players: new Map([[id, { id, sessionToken, name: name.data, score: 0, connected: true }]]),
           round: 0,
           musicPlaying: false,
           maxRounds: 10,
@@ -264,6 +420,7 @@ io.on("connection", (socket) => {
                 id: song.id,
                 provider: song.provider === "jellyfin" ? "jellyfin" as const : song.provider === "spotify" ? "spotify" as const : "mock" as const,
                 providerTrackId: song.providerTrackId || undefined,
+                jellyfinTrackId: song.jellyfinTrackId || undefined,
                 spotifyUrl: song.spotifyUrl || undefined,
                 title: song.title,
                 artist: song.artist,
@@ -278,35 +435,41 @@ io.on("connection", (socket) => {
       games.set(c, g);
       identity = { game: g, playerId: id, host: true };
       socket.join(c);
-      cb({ game: safeGame(g), playerId: id });
+      cb({ game: safeGame(g), playerId: id, playerToken: sessionToken });
       io.to(c).emit("game-state", safeGame(g));
     } catch (e) {
       cb({ error: `Could not load saved playlists: ${playlistStorageError(e)}` });
     }
   });
-  socket.on("join-game", (payload: { code?: string; name?: string; playerId?: string }, cb: (x: any) => void) => {
+  socket.on("join-game", (payload: { code?: string; name?: string; playerId?: string; playerToken?: string }, cb: (x: any) => void) => {
     const c = codeSchema.safeParse(payload?.code),
       name = nameSchema.safeParse(payload?.name ?? "");
-    if (!c.success || !name.success) return cb({ error: "Enter a valid four character code and a name." });
+    if (!c.success || !name.success) return cb({ error: "Enter a valid six character code and a name." });
+    if (!incrementLimit(joinAttemptsByAddress, clientAddress(socket), 50)) return cb({ error: "Too many room attempts. Wait a minute and try again." });
     const g = games.get(c.data);
     if (!g) return cb({ error: "Room not found. Check the code and try again." });
     if (g.status === "GAME_OVER") return cb({ error: "This game has ended." });
-    let p = payload.playerId ? g.players.get(payload.playerId) : undefined;
+    if (!payload.playerToken && g.players.size >= 32) return cb({ error: "This room is full." });
+    let p = payload.playerId && payload.playerToken
+      ? g.players.get(payload.playerId)
+      : undefined;
+    if (p && p.sessionToken !== payload.playerToken) p = undefined;
     if (!p) {
       const id = randomUUID();
-      p = { id, name: name.data, score: 0, connected: true };
+      p = { id, sessionToken: randomBytes(32).toString("hex"), name: name.data, score: 0, connected: true };
       g.players.set(id, p);
     }
     p.connected = true;
     identity = { game: g, playerId: p.id, host: p.id === g.hostId };
     socket.join(c.data);
-    cb({ game: safeGame(g), playerId: p.id });
+    cb({ game: safeGame(g), playerId: p.id, playerToken: p.sessionToken });
     if (identity.host && g.status === "PLAYING") socket.emit("host-track", { streamUrl: g.streamUrl, simulated: !g.streamUrl, roundEndsAt: g.roundEndsAt });
     io.to(c.data).emit("game-state", safeGame(g));
   });
   const auth = (host = false) => {
     if (!identity) throw new Error("Join a room first");
     if (host && !identity.host) throw new Error("Only the host can do that");
+    if (host && !adminAuthenticated) throw new Error("Log in with the admin account to control this game.");
     return identity.game;
   };
   socket.on("set-round-count", (payload: { count?: number }, cb: (x: any) => void) => {
@@ -320,12 +483,17 @@ io.on("connection", (socket) => {
   });
   const beginRound = (g: Game) => {
     if (g.round === 0) g.gamePlaylistId = g.selectedPlaylistId;
+    if (!(g.provider instanceof JellyfinMusicProvider) || !jellyfinReady)
+      throw new Error("Jellyfin must be connected to play game tracks. Connect the Jellyfin library and try again.");
     const playlist = g.playlists.find((item) => item.id === g.gamePlaylistId);
     if (!playlist) throw new Error("Create a playlist, then select it before starting the game.");
-    if (!playlist.songs.length) throw new Error("Add at least one song to the selected playlist before starting.");
-    const pool = playlist.songs.filter((song) => !g.used.includes(song.id));
-    if (!pool.length) g.used = [];
-    const available = playlist.songs.filter((song) => !g.used.includes(song.id));
+    const playableSongs = playlist.songs.filter(hasJellyfinAudio);
+    if (!playableSongs.length) throw new Error("No tracks in this playlist are matched to Jellyfin. Use Auto-Match or add Jellyfin tracks before starting.");
+    let available = playableSongs.filter((song) => !g.used.includes(song.id));
+    if (!available.length) {
+      g.used = [];
+      available = playableSongs;
+    }
     const song = available[Math.floor(Math.random() * available.length)];
     g.used.push(song.id);
     g.round++;
@@ -348,22 +516,87 @@ io.on("connection", (socket) => {
     socket.emit("host-track", { streamUrl: g.streamUrl, simulated: !g.streamUrl, roundEndsAt: g.roundEndsAt });
   };
   socket.on("library-jellyfin-connect", (_payload: unknown, cb: (x: any) => void) => {
+    try { requireLibraryAdmin(); } catch (e) { return cb({ error: (e as Error).message }); }
     if (!jellyfinProvider) return cb({ error: "Jellyfin is not configured on this server." });
     if (!jellyfinReady) return cb({ error: "The server could not connect to Jellyfin. Check its connection and credentials." });
     cb({ ok: true });
   });
   socket.on("library-jellyfin-playlists", async (_payload: unknown, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
       cb({ playlists: await jellyfinProvider.listPlaylists() });
     } catch (e) { cb({ error: (e as Error).message }); }
   });
   socket.on("library-jellyfin-search", async (payload: { query?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
       const query = z.string().trim().min(1).max(100).parse(payload?.query || "");
       cb({ songs: await jellyfinProvider.searchSongs(query) });
     } catch (e) { cb({ error: (e as Error).message }); }
+  });
+  socket.on("library-jellyfin-match-song", async (payload: { songId?: string; jellyfinSongId?: string }, cb: (x: any) => void) => {
+    try {
+      requireLibraryAdmin();
+      if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
+      const songId = z.string().min(1).max(200).parse(payload?.songId || "");
+      const jellyfinSongId = payload?.jellyfinSongId ? z.string().min(1).max(200).parse(payload.jellyfinSongId) : "";
+      const spotifySong = await prisma.song.findUnique({ where: { id: songId } });
+      if (!spotifySong || spotifySong.provider !== "spotify") throw new Error("Choose a Spotify track to match.");
+      const jellyfinSong = jellyfinSongId ? await jellyfinProvider.getSong(jellyfinSongId) : undefined;
+      if (jellyfinSongId && !jellyfinSong?.providerTrackId) throw new Error("That Jellyfin result cannot be streamed.");
+      await prisma.song.update({ where: { id: songId }, data: { jellyfinTrackId: jellyfinSong?.providerTrackId || null } });
+      cb({ ok: true, jellyfinTrackId: jellyfinSong?.providerTrackId || null });
+    } catch (e) { cb({ error: playlistStorageError(e) }); }
+  });
+  socket.on("library-jellyfin-auto-match", async (payload: { playlistId?: string }, cb: (x: any) => void) => {
+    try {
+      requireLibraryAdmin();
+      if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
+      const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
+      const playlist = await prisma.playlist.findUnique({ where: { id: playlistId }, include: { songs: { include: { song: true } } } });
+      if (!playlist) throw new Error("Playlist not found.");
+      const unmatched = playlist.songs.map(({ song }) => song).filter((song) => song.provider === "spotify" && !song.jellyfinTrackId);
+      if (!unmatched.length) return cb({ ok: true, matchedCount: 0, ambiguousCount: 0, unmatchedCount: 0 });
+
+      const librarySongs = await jellyfinProvider.listAudioSongs();
+      const libraryByTitleAndArtist = new Map<string, Song[]>();
+      for (const item of librarySongs) {
+        const key = `${normalizeMatchText(item.title)}|${normalizeMatchText(item.artist)}`;
+        const candidates = libraryByTitleAndArtist.get(key) || [];
+        candidates.push(item);
+        libraryByTitleAndArtist.set(key, candidates);
+      }
+      const matches: { songId: string; jellyfinTrackId: string }[] = [];
+      let ambiguousCount = 0;
+      for (const song of unmatched) {
+        const candidates = libraryByTitleAndArtist.get(`${normalizeMatchText(song.title)}|${normalizeMatchText(song.artist)}`) || [];
+        if (candidates.length === 1 && candidates[0]?.providerTrackId) {
+          matches.push({ songId: song.id, jellyfinTrackId: candidates[0].providerTrackId });
+          continue;
+        }
+        if (candidates.length > 1) {
+          const album = normalizeMatchText(song.album);
+          const ranked = candidates.map((candidate) => ({
+            candidate,
+            score: (album && normalizeMatchText(candidate.album) === album ? 4 : 0)
+              + (song.releaseYear > 0 && candidate.releaseYear === song.releaseYear ? 2 : 0),
+          }));
+          const bestScore = Math.max(...ranked.map(({ score }) => score));
+          const best = ranked.filter(({ score }) => score === bestScore);
+          if (bestScore > 0 && best.length === 1 && best[0]?.candidate.providerTrackId) {
+            matches.push({ songId: song.id, jellyfinTrackId: best[0].candidate.providerTrackId });
+          } else ambiguousCount++;
+        }
+      }
+      if (matches.length) {
+        await prisma.$transaction(matches.map(({ songId, jellyfinTrackId }) => prisma.song.update({
+          where: { id: songId }, data: { jellyfinTrackId },
+        })));
+      }
+      cb({ ok: true, matchedCount: matches.length, ambiguousCount, unmatchedCount: unmatched.length - matches.length - ambiguousCount });
+    } catch (e) { cb({ error: playlistStorageError(e) }); }
   });
   const appendLibrarySongs = async (playlistId: string, importedSongs: Song[]) => {
     const playlist = await prisma.playlist.findUnique({ where: { id: playlistId }, include: { songs: true } });
@@ -396,6 +629,7 @@ io.on("connection", (socket) => {
   };
   socket.on("library-jellyfin-import-playlist", async (payload: { playlistId?: string; id?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
       const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
       const id = z.string().trim().min(1).max(100).parse(payload?.id || "");
@@ -406,6 +640,7 @@ io.on("connection", (socket) => {
   });
   socket.on("library-jellyfin-add-song", async (payload: { playlistId?: string; id?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
       const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
       const id = z.string().min(1).max(100).parse(payload?.id || "");
@@ -478,14 +713,15 @@ io.on("connection", (socket) => {
   });
   socket.on("spotify-status", (payload: { libraryId?: string }, cb: (x: any) => void) => {
     try {
-      const hostId = payload?.libraryId ? z.string().min(8).max(100).parse(payload.libraryId) : (auth(true), identity!.playerId);
-      cb({ connected: spotifyTokens.has(hostId), configured: Boolean(spotifyClientId) });
+      requireLibraryAdmin();
+      cb({ connected: spotifyTokens.has(libraryAdminId), configured: Boolean(spotifyClientId) });
     }
     catch (e) { cb({ error: (e as Error).message }); }
   });
   socket.on("spotify-auth-url", (payload: { libraryId?: string }, cb: (x: any) => void) => {
     try {
-      const hostId = payload?.libraryId ? z.string().min(8).max(100).parse(payload.libraryId) : (auth(true), identity!.playerId);
+      requireLibraryAdmin();
+      const hostId = libraryAdminId;
       if (!spotifyClientId) throw new Error("Set SPOTIFY_CLIENT_ID in the server environment and restart the app.");
       const redirect = new URL(spotifyRedirectUri);
       if (!(["http:", "https:"].includes(redirect.protocol))) throw new Error("SPOTIFY_REDIRECT_URI must use HTTP or HTTPS.");
@@ -506,15 +742,38 @@ io.on("connection", (socket) => {
   });
   socket.on("spotify-disconnect", (payload: { libraryId?: string }, cb: (x: any) => void) => {
     try {
-      const hostId = payload?.libraryId ? z.string().min(8).max(100).parse(payload.libraryId) : (auth(true), identity!.playerId);
-      spotifyTokens.delete(hostId);
+      requireLibraryAdmin();
+      spotifyTokens.delete(libraryAdminId);
       cb({ ok: true });
     }
     catch (e) { cb({ error: (e as Error).message }); }
   });
+  socket.on("spotify-playlists", async (payload: { libraryId?: string }, cb: (x: any) => void) => {
+    try {
+      requireLibraryAdmin();
+      const hostId = libraryAdminId;
+      const playlists: { id: string; name: string; trackCount: number; url: string }[] = [];
+      for (let offset = 0; ; offset += 50) {
+        const page = await spotifyApi<{ items?: any[]; next?: string | null }>(
+          hostId, `https://api.spotify.com/v1/me/playlists?limit=50&offset=${offset}`,
+        );
+        for (const item of page.items || []) {
+          playlists.push({
+            id: item.id,
+            name: item.name || "Untitled playlist",
+            trackCount: item.items?.total ?? item.tracks?.total ?? 0,
+            url: item.external_urls?.spotify || `https://open.spotify.com/playlist/${item.id}`,
+          });
+        }
+        if (!page.next) break;
+      }
+      cb({ playlists });
+    } catch (e) { cb({ error: playlistStorageError(e) }); }
+  });
   socket.on("spotify-import", async (payload: { url?: string; playlistId?: string; libraryId?: string }, cb: (x: any) => void) => {
     try {
-      const hostId = payload?.libraryId ? z.string().min(8).max(100).parse(payload.libraryId) : (auth(true), identity!.playerId);
+      requireLibraryAdmin();
+      const hostId = libraryAdminId;
       const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
       const playlist = await prisma.playlist.findUnique({ where: { id: playlistId }, include: { songs: true } });
       if (!playlist) throw new Error("Create or select a playlist before importing Spotify tracks.");
@@ -544,17 +803,20 @@ io.on("connection", (socket) => {
   });
   socket.on("list-playlists", async (_payload: unknown, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const playlists = await prisma.playlist.findMany({
         orderBy: { createdAt: "asc" },
         include: { songs: { orderBy: { position: "asc" }, include: { song: true } } },
       });
       cb({ playlists: playlists.map((playlist) => ({ id: playlist.id, name: playlist.name, songs: playlist.songs.map(({ song }) => ({
         id: song.id, title: song.title, artist: song.artist, album: song.album, releaseYear: song.releaseYear,
+        provider: song.provider, jellyfinTrackId: song.jellyfinTrackId,
       })) })) });
     } catch (e) { cb({ error: playlistStorageError(e) }); }
   });
   socket.on("create-playlist", async (payload: { name?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const name = z.string().trim().min(1).max(32).parse(payload?.name || "");
       const saved = await prisma.playlist.create({ data: { name } });
       cb({ ok: true, playlist: { id: saved.id, name: saved.name, songs: [] } });
@@ -562,6 +824,7 @@ io.on("connection", (socket) => {
   });
   socket.on("rename-playlist", async (payload: { id?: string; name?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const id = z.string().min(1).max(100).parse(payload?.id || "");
       const name = z.string().trim().min(1).max(32).parse(payload?.name || "");
       await prisma.playlist.update({ where: { id }, data: { name } });
@@ -570,6 +833,7 @@ io.on("connection", (socket) => {
   });
   socket.on("delete-playlist", async (payload: { id?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const id = z.string().min(1).max(100).parse(payload?.id || "");
       await prisma.playlist.delete({ where: { id } });
       cb({ ok: true });
@@ -577,6 +841,7 @@ io.on("connection", (socket) => {
   });
   socket.on("add-playlist-song", async (payload: { playlistId?: string; title?: string; artist?: string; album?: string; year?: number }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
       const title = z.string().trim().min(1).max(100).parse(payload?.title || "");
       const artist = z.string().trim().min(1).max(100).parse(payload?.artist || "");
@@ -593,6 +858,7 @@ io.on("connection", (socket) => {
   });
   socket.on("remove-playlist-song", async (payload: { playlistId?: string; songId?: string }, cb: (x: any) => void) => {
     try {
+      requireLibraryAdmin();
       const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
       const songId = z.string().min(1).max(200).parse(payload?.songId || "");
       await prisma.playlistSong.delete({ where: { playlistId_songId: { playlistId, songId } } });
@@ -795,4 +1061,5 @@ io.on("connection", (socket) => {
   });
 });
 const port = Number(process.env.PORT) || 3001;
-http.listen(port, "0.0.0.0", () => console.log(`Side A server listening on ${port}`));
+const host = process.env.HOST || "127.0.0.1";
+http.listen(port, host, () => console.log(`Jamster server listening on ${host}:${port}`));
