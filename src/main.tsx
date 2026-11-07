@@ -75,6 +75,8 @@ function App() {
     source: MediaElementAudioSourceNode;
     highPass: BiquadFilterNode;
     lowPass: BiquadFilterNode;
+    distortion: WaveShaperNode;
+    stutterGain: GainNode;
     gain: GainNode;
   }>());
   useEffect(() => {
@@ -99,24 +101,37 @@ function App() {
     const player = audioRef.current;
     if (!player) return;
     const telephoneFilter = game?.bonusChallenge === "TELEPHONE_FILTER";
+    const stutteredMusic = game?.bonusChallenge === "STUTTERED_MUSIC";
     let graph = audioFilterGraphRef.current.get(player);
-    if (!graph && telephoneFilter) {
+    if (!graph && (telephoneFilter || stutteredMusic)) {
       try {
         const context = soundContextRef.current ?? new AudioContext();
         soundContextRef.current = context;
         const source = context.createMediaElementSource(player);
         const highPass = context.createBiquadFilter();
         highPass.type = "highpass";
-        highPass.frequency.value = 300;
+        highPass.frequency.value = 650;
         const lowPass = context.createBiquadFilter();
         lowPass.type = "lowpass";
-        lowPass.frequency.value = 3400;
+        lowPass.frequency.value = 1800;
+        const distortion = context.createWaveShaper();
+        const curve = new Float32Array(1024);
+        const distortionAmount = 3;
+        const distortionScale = Math.tanh(distortionAmount);
+        for (let index = 0; index < curve.length; index += 1) {
+          const sample = (index * 2) / (curve.length - 1) - 1;
+          curve[index] = Math.tanh(sample * distortionAmount) / distortionScale;
+        }
+        distortion.curve = curve;
+        distortion.oversample = "4x";
+        const stutterGain = context.createGain();
+        stutterGain.gain.value = 1;
         const gain = context.createGain();
         gain.gain.value = player.volume;
-        graph = { context, source, highPass, lowPass, gain };
+        graph = { context, source, highPass, lowPass, distortion, stutterGain, gain };
         audioFilterGraphRef.current.set(player, graph);
       } catch {
-        setErr("This browser could not apply the telephone filter to the song.");
+        setErr("This browser could not apply the audio effect to the song.");
         return;
       }
     }
@@ -125,39 +140,62 @@ function App() {
       graph.source.disconnect();
       graph.highPass.disconnect();
       graph.lowPass.disconnect();
+      graph.distortion.disconnect();
+      graph.stutterGain.disconnect();
       graph.gain.disconnect();
       if (telephoneFilter) {
         graph.source.connect(graph.highPass);
         graph.highPass.connect(graph.lowPass);
-        graph.lowPass.connect(graph.gain);
-      } else graph.source.connect(graph.gain);
+        graph.lowPass.connect(graph.distortion);
+        graph.distortion.connect(graph.stutterGain);
+      } else graph.source.connect(graph.stutterGain);
+      graph.stutterGain.connect(graph.gain);
       graph.gain.connect(graph.context.destination);
       player.volume = 1;
       if (graph.context.state === "suspended") void graph.context.resume().catch(() => {});
     } catch {
-      setErr("This browser could not apply the telephone filter to the song.");
+      setErr("This browser could not apply the audio effect to the song.");
     }
     return () => {
       graph?.source.disconnect();
       graph?.highPass.disconnect();
       graph?.lowPass.disconnect();
+      graph?.distortion.disconnect();
+      graph?.stutterGain.disconnect();
       graph?.gain.disconnect();
     };
   }, [game?.round, game?.bonusChallenge, streamUrl]);
   useEffect(() => {
     const player = audioRef.current;
-    if (!player || game?.bonusChallenge !== "STUTTERED_MUSIC" || !playing) {
+    const graph = player && audioFilterGraphRef.current.get(player);
+    if (!player || !graph || game?.bonusChallenge !== "STUTTERED_MUSIC" || !playing) {
+      if (graph) {
+        const now = graph.context.currentTime;
+        const param = graph.stutterGain.gain;
+        param.cancelScheduledValues(now);
+        param.setValueAtTime(param.value, now);
+        param.linearRampToValueAtTime(1, now + 0.06);
+      }
       if (player) player.muted = false;
       return;
     }
     let audible = true;
     const interval = window.setInterval(() => {
       audible = !audible;
-      player.muted = !audible;
+      const now = graph.context.currentTime;
+      const param = graph.stutterGain.gain;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(audible ? 1 : 0, now + 0.06);
     }, 500);
     return () => {
       window.clearInterval(interval);
       player.muted = false;
+      const now = graph.context.currentTime;
+      const param = graph.stutterGain.gain;
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(1, now + 0.06);
     };
   }, [game?.round, game?.bonusChallenge, playing, streamUrl]);
   const getAudioPlaybackError = (error?: unknown) => {

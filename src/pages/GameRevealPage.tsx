@@ -1,4 +1,5 @@
 import type { Game, Player } from "../types";
+import { getBonusChallengeName } from "../bonusChallenges";
 
 export function GameRevealPage({ game, sorted, tick }: { game: Game; sorted: Player[]; tick: number }) {
   const roundPoints = new Map<string, number>((game.results || []).map((result) => [result.playerId, result.points]));
@@ -6,7 +7,7 @@ export function GameRevealPage({ game, sorted, tick }: { game: Game; sorted: Pla
 
   return <section className="reveal-view">
     <div className="eyebrow">THE MOMENT OF TRUTH &middot; ROUND {game.round}</div>
-    {game.bonusChallenge && <div className="bonus-round-tag reveal-bonus-tag">{game.bonusChallenge === "SLOWED_MUSIC" ? "SLOWED SONG BONUS" : game.bonusChallenge === "STUTTERED_MUSIC" ? "STUTTERED SONG BONUS" : "TELEPHONE FILTER BONUS"} &middot; DOUBLE TITLE POINTS</div>}
+    {game.bonusChallenge && <div className="bonus-round-tag reveal-bonus-tag">{getBonusChallengeName(game.bonusChallenge)}</div>}
     <h1>Were you <em>there?</em></h1>
     <div className="answer-card">
       <span className="eyebrow">THE SONG WAS</span>
