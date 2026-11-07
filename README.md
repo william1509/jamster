@@ -20,7 +20,7 @@ Playback depends on Jellyfin being reachable from the app server and the host br
 - The Compose app port binds to `127.0.0.1` by default so a host reverse proxy can reach it without exposing the Node port directly. Terminate HTTPS at the proxy, forward WebSocket upgrades, and make the proxy overwrite `Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` with the public request values. If the proxy runs in another container, attach it to the app's Docker network, route to `app:3001`, and remove the app's `ports` mapping so it is not published on the host. Set `TRUSTED_PROXY_ADDRESSES` to the app-side IP address(es) of the proxy; only those peers are trusted to supply forwarded headers.
 - The browser session token is a bearer credential stored in local storage. Anyone who obtains it can resume that player's seat; the host token grants control of that game. Room codes are six characters and room joins are rate limited.
 
-The integration uses Jellyfin's `Users/AuthenticateByName`, `Items` search, and `/Audio/{itemId}/stream` endpoints. See the [Jellyfin API documentation](https://api.jellyfin.org/) for API details.
+The integration uses Jellyfin's `Users/AuthenticateByName`, `Items` search, and `/Audio/{itemId}/universal` endpoint to provide browser-compatible audio. See the [Jellyfin API documentation](https://api.jellyfin.org/) for API details.
 
 ## Run locally
 

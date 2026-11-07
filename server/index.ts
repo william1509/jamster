@@ -12,9 +12,10 @@ import { z } from "zod";
 import { JellyfinMusicProvider, MockMusicProvider, type MusicProvider, type Song } from "./music";
 import { scoreAnswer } from "./scoring";
 
-type Player = { id: string; sessionToken: string; name: string; score: number; connected: boolean };
+type Player = { id: string; sessionToken: string; name: string; score: number; connected: boolean; isPlayer: boolean; socketId?: string };
 type Answer = { playerId: string; title: string; artist: string; year: number | null; points: number };
 type Playlist = { id: string; name: string; songs: Song[] };
+type BonusChallenge = "SLOWED_MUSIC" | "STUTTERED_MUSIC" | "TELEPHONE_FILTER";
 type Game = {
   code: string;
   hostId: string;
@@ -22,12 +23,21 @@ type Game = {
   players: Map<string, Player>;
   round: number;
   maxRounds: number;
+  roundDurationSeconds: number;
+  revealDurationSeconds: number;
+  bonusRoundsEnabled: boolean;
+  bonusChallenge?: BonusChallenge;
   songId?: string;
   currentSong?: Song;
   streamUrl?: string;
   streamTicket?: string;
   roundEndsAt?: number;
   roundRemainingMs?: number;
+  answerEndsAt?: number;
+  revealEndsAt?: number;
+  songTimer?: ReturnType<typeof setTimeout>;
+  answerTimer?: ReturnType<typeof setTimeout>;
+  revealTimer?: ReturnType<typeof setTimeout>;
   musicPlaying: boolean;
   provider: MusicProvider;
   playlists: Playlist[];
@@ -147,7 +157,7 @@ const jellyfinProvider = configuredJellyfin
   : undefined;
 let jellyfinReady = false;
 const hasJellyfinAudio = (song: Song) => Boolean(song.jellyfinTrackId || (song.provider === "jellyfin" && song.providerTrackId));
-const streamTickets = new Map<string, { url: string; expiresAt: number }>();
+const streamTickets = new Map<string, { url: string; headers?: Record<string, string>; expiresAt: number }>();
 if (jellyfinProvider) {
   void jellyfinProvider.connect().then(() => { jellyfinReady = true; console.log("Jellyfin connected"); })
     .catch((error: unknown) => console.error("Jellyfin connection failed:", (error as Error).message));
@@ -194,6 +204,30 @@ app.get("/api/spotify/callback", async (req, res) => {
   res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`);
   res.type("html").send(`<!doctype html><meta charset="utf-8"><title>Spotify connection</title><p>${ok ? "Connected." : "Connection failed."} This window should close automatically.</p><script nonce="${nonce}">window.opener?.postMessage(${payload},${JSON.stringify(targetOrigin)});window.close()</script>`);
 });
+app.head("/api/music/stream/:ticket", async (req, res) => {
+  const stream = streamTickets.get(req.params.ticket);
+  if (!stream || stream.expiresAt < Date.now()) {
+    streamTickets.delete(req.params.ticket);
+    res.setHeader("X-Stream-Check", "ticket-expired");
+    return res.status(404).end();
+  }
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), Math.max(0, stream.expiresAt - Date.now()));
+  res.on("close", () => controller.abort());
+  try {
+    const upstream = await fetch(stream.url, { method: "HEAD", headers: stream.headers, signal: controller.signal });
+    res.setHeader("X-Stream-Check", "jellyfin");
+    res.status(upstream.status);
+    for (const name of ["content-type", "content-length", "content-range", "accept-ranges"] as const) {
+      const value = upstream.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+    res.end();
+  } catch {
+    res.setHeader("X-Stream-Check", "upstream-unreachable");
+    res.status(502).end();
+  } finally { clearTimeout(abortTimer); }
+});
 app.get("/api/music/stream/:ticket", async (req, res) => {
   const stream = streamTickets.get(req.params.ticket);
   if (!stream || stream.expiresAt < Date.now()) {
@@ -205,8 +239,15 @@ app.get("/api/music/stream/:ticket", async (req, res) => {
   res.on("close", () => controller.abort());
   try {
     const headers: Record<string, string> = {};
+    Object.assign(headers, stream.headers);
     if (req.header("range")) headers.Range = req.header("range")!;
     const upstream = await fetch(stream.url, { headers, signal: controller.signal });
+    const contentType = upstream.headers.get("content-type") || "";
+    if (!upstream.ok || /^(application\/json|text\/html)/i.test(contentType)) {
+      await upstream.body?.cancel();
+      console.warn(`[music] Jellyfin stream returned HTTP ${upstream.status} (${contentType || "no content type"}).`);
+      return res.status(upstream.ok ? 502 : upstream.status).json({ error: "Jellyfin did not return playable audio." });
+    }
     res.status(upstream.status);
     for (const name of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"] as const) {
       const value = upstream.headers.get(name);
@@ -273,18 +314,28 @@ const code = () => {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   return [...randomBytes(6)].map((b) => chars[b % chars.length]).join("");
 };
+const isScheduledBonusRound = (g: Game) => g.bonusRoundsEnabled && g.round > 0 && (g.round % 5 === 0 || (g.maxRounds < 5 && g.round === g.maxRounds));
 const safeGame = (g: Game, reveal = false) => ({
   code: g.code,
   status: g.status,
   round: g.round,
   maxRounds: g.maxRounds,
-  players: [...g.players.values()].map((p) => ({ id: p.id, name: p.name, score: p.score, connected: p.connected })),
+  roundDurationSeconds: g.roundDurationSeconds,
+  revealDurationSeconds: g.revealDurationSeconds,
+  bonusRoundsEnabled: g.bonusRoundsEnabled,
+  bonusChallenge: g.bonusChallenge,
+  players: [...g.players.values()].filter((p) => p.isPlayer).map((p) => ({ id: p.id, name: p.name, score: p.score, connected: p.connected })),
+  hostName: g.players.get(g.hostId)?.name || "Host",
+  hostPlayerId: g.players.get(g.hostId)?.isPlayer ? g.hostId : undefined,
+  hostIsPlayer: Boolean(g.players.get(g.hostId)?.isPlayer),
   answered: g.answers.size,
   answeredPlayers: [...g.answers.keys()],
   song: reveal ? g.currentSong : undefined,
   playlists: g.playlists.map((p) => ({ id: p.id, name: p.name, trackCount: p.songs.length, jellyfinTrackCount: p.songs.filter(hasJellyfinAudio).length })),
   selectedPlaylistId: g.gamePlaylistId || g.selectedPlaylistId,
   roundEndsAt: g.roundEndsAt,
+  answerEndsAt: g.answerEndsAt,
+  revealEndsAt: g.revealEndsAt,
   roundTimeRemainingMs: g.roundEndsAt ? Math.max(0, g.roundEndsAt - Date.now()) : g.roundRemainingMs,
   musicPlaying: g.musicPlaying,
   musicSource: g.provider instanceof JellyfinMusicProvider ? "JELLYFIN" : "MOCK",
@@ -300,14 +351,37 @@ const codeSchema = z
     .regex(/^[A-Z2-9]{6}$/),
   nameSchema = z.string().trim().min(1).max(20),
   answerSchema = z.object({
-    title: z.string().trim().max(100),
-    artist: z.string().trim().max(100),
-    year: z.number().int().min(1900).max(2100).nullable(),
-  });
+    title: z.string().trim().max(100).optional().default(""),
+    artist: z.string().trim().max(100).optional().default(""),
+    year: z.number().int().min(1900).max(2100).nullable().optional().default(null),
+  }).refine((answer) => answer.title.length > 0 || answer.artist.length > 0 || answer.year !== null, "Enter at least one part of your answer.");
 io.on("connection", (socket) => {
   let identity: { game: Game; playerId: string; host: boolean } | undefined;
   let adminAuthenticated = false;
   let adminSessionToken = "";
+  const leaveCurrentGame = () => {
+    if (!identity) return;
+    const { game: g, playerId } = identity;
+    const player = g.players.get(playerId);
+    if (player?.socketId === socket.id) {
+      player.connected = false;
+      player.socketId = undefined;
+    }
+    socket.leave(g.code);
+    identity = undefined;
+    io.to(g.code).emit("game-state", safeGame(g));
+    if (![...g.players.values()].some((entry) => entry.connected))
+      setTimeout(() => {
+        if (![...g.players.values()].some((entry) => entry.connected)) {
+          if (g.songTimer) clearTimeout(g.songTimer);
+          if (g.answerTimer) clearTimeout(g.answerTimer);
+          if (g.revealTimer) clearTimeout(g.revealTimer);
+          if (g.streamTicket) streamTickets.delete(g.streamTicket);
+          g.streamUrl = undefined;
+          games.delete(g.code);
+        }
+      }, 60 * 60 * 1000);
+  };
   const issueAdminSession = () => {
     const now = Date.now();
     for (const [token, expiresAt] of adminSessions) if (expiresAt <= now) adminSessions.delete(token);
@@ -406,10 +480,13 @@ io.on("connection", (socket) => {
           code: c,
           hostId: id,
           status: "LOBBY",
-          players: new Map([[id, { id, sessionToken, name: name.data, score: 0, connected: true }]]),
+          players: new Map([[id, { id, sessionToken, name: name.data, score: 0, connected: true, isPlayer: true, socketId: socket.id }]]),
           round: 0,
           musicPlaying: false,
           maxRounds: 10,
+          roundDurationSeconds: 60,
+          revealDurationSeconds: 5,
+          bonusRoundsEnabled: true,
           answers: new Map(),
           used: [],
           provider: jellyfinProvider || new MockMusicProvider(),
@@ -432,6 +509,7 @@ io.on("connection", (socket) => {
             })),
           selectedPlaylistId: savedPlaylists[0]?.id || "",
         };
+      leaveCurrentGame();
       games.set(c, g);
       identity = { game: g, playerId: id, host: true };
       socket.join(c);
@@ -449,17 +527,19 @@ io.on("connection", (socket) => {
     const g = games.get(c.data);
     if (!g) return cb({ error: "Room not found. Check the code and try again." });
     if (g.status === "GAME_OVER") return cb({ error: "This game has ended." });
-    if (!payload.playerToken && g.players.size >= 32) return cb({ error: "This room is full." });
+    if (!payload.playerToken && [...g.players.values()].filter((player) => player.isPlayer).length >= 32) return cb({ error: "This room is full." });
+    if (identity && identity.game.code !== c.data) leaveCurrentGame();
     let p = payload.playerId && payload.playerToken
       ? g.players.get(payload.playerId)
       : undefined;
     if (p && p.sessionToken !== payload.playerToken) p = undefined;
     if (!p) {
       const id = randomUUID();
-      p = { id, sessionToken: randomBytes(32).toString("hex"), name: name.data, score: 0, connected: true };
+      p = { id, sessionToken: randomBytes(32).toString("hex"), name: name.data, score: 0, connected: true, isPlayer: true, socketId: socket.id };
       g.players.set(id, p);
     }
     p.connected = true;
+    p.socketId = socket.id;
     identity = { game: g, playerId: p.id, host: p.id === g.hostId };
     socket.join(c.data);
     cb({ game: safeGame(g), playerId: p.id, playerToken: p.sessionToken });
@@ -481,6 +561,79 @@ io.on("connection", (socket) => {
       cb({ ok: true });
     } catch (e) { cb({ error: (e as Error).message }); }
   });
+  socket.on("set-round-duration", (payload: { seconds?: number }, cb: (x: any) => void) => {
+    try {
+      const g = auth(true);
+      if (g.round > 0 || g.status !== "LOBBY") throw new Error("The round duration is locked after the game starts.");
+      const seconds = Number(payload?.seconds);
+      if (![15, 30, 45, 60, 90, 120].includes(seconds)) throw new Error("Choose a supported round duration.");
+      g.roundDurationSeconds = seconds;
+      io.to(g.code).emit("game-state", safeGame(g));
+      cb({ ok: true });
+    } catch (e) { cb({ error: (e as Error).message }); }
+  });
+  socket.on("set-reveal-duration", (payload: { seconds?: number }, cb: (x: any) => void) => {
+    try {
+      const g = auth(true);
+      if (g.round > 0 || g.status !== "LOBBY") throw new Error("The reveal duration is locked after the game starts.");
+      const seconds = Number(payload?.seconds);
+      if (![3, 5, 10, 15, 20, 30].includes(seconds)) throw new Error("Choose a supported reveal duration.");
+      g.revealDurationSeconds = seconds;
+      io.to(g.code).emit("game-state", safeGame(g));
+      cb({ ok: true });
+    } catch (e) { cb({ error: (e as Error).message }); }
+  });
+  socket.on("set-bonus-rounds", (payload: { enabled?: boolean }, cb: (x: any) => void) => {
+    try {
+      const g = auth(true);
+      if (g.round > 0 || g.status !== "LOBBY") throw new Error("Bonus rounds are locked after the game starts.");
+      g.bonusRoundsEnabled = Boolean(payload?.enabled);
+      io.to(g.code).emit("game-state", safeGame(g));
+      cb({ ok: true });
+    } catch (e) { cb({ error: (e as Error).message }); }
+  });
+  socket.on("set-host-participation", (payload: { enabled?: boolean }, cb: (x: any) => void) => {
+    try {
+      const g = auth(true);
+      if (g.round > 0 || g.status !== "LOBBY") throw new Error("Host participation is locked after the game starts.");
+      const hostPlayer = g.players.get(g.hostId);
+      if (!hostPlayer) throw new Error("The host player could not be found.");
+      hostPlayer.isPlayer = Boolean(payload?.enabled);
+      io.to(g.code).emit("game-state", safeGame(g));
+      cb({ ok: true });
+    } catch (e) { cb({ error: (e as Error).message }); }
+  });
+  const clearRoundTimers = (g: Game) => {
+    if (g.songTimer) clearTimeout(g.songTimer);
+    if (g.answerTimer) clearTimeout(g.answerTimer);
+    if (g.revealTimer) clearTimeout(g.revealTimer);
+    g.songTimer = undefined;
+    g.answerTimer = undefined;
+    g.revealTimer = undefined;
+  };
+  const clearSongStream = (g: Game) => {
+    if (g.streamTicket) streamTickets.delete(g.streamTicket);
+    g.streamTicket = undefined;
+    g.streamUrl = undefined;
+  };
+  socket.on("leave-game", () => {
+    leaveCurrentGame();
+  });
+  const notifyHostTrack = (g: Game) => {
+    const socketId = g.players.get(g.hostId)?.socketId;
+    if (socketId) io.to(socketId).emit("host-track", { streamUrl: g.streamUrl, simulated: !g.streamUrl, roundEndsAt: g.roundEndsAt });
+  };
+  let beginAnswerWindow = (_g: Game) => {};
+  const scheduleSongEnd = (g: Game, delayMs: number) => {
+    if (g.songTimer) clearTimeout(g.songTimer);
+    g.songTimer = setTimeout(() => {
+      if (g.status !== "PLAYING") return;
+      g.roundRemainingMs = 0;
+      g.roundEndsAt = undefined;
+      g.musicPlaying = false;
+      beginAnswerWindow(g);
+    }, Math.max(0, delayMs));
+  };
   const beginRound = (g: Game) => {
     if (g.round === 0) g.gamePlaylistId = g.selectedPlaylistId;
     if (!(g.provider instanceof JellyfinMusicProvider) || !jellyfinReady)
@@ -495,25 +648,86 @@ io.on("connection", (socket) => {
       available = playableSongs;
     }
     const song = available[Math.floor(Math.random() * available.length)];
+    clearRoundTimers(g);
+    clearSongStream(g);
     g.used.push(song.id);
     g.round++;
+    const bonusChallenges: BonusChallenge[] = ["SLOWED_MUSIC", "STUTTERED_MUSIC", "TELEPHONE_FILTER"];
+    g.bonusChallenge = isScheduledBonusRound(g)
+      ? bonusChallenges[Math.floor(Math.random() * bonusChallenges.length)]
+      : undefined;
     g.songId = song.id;
     g.currentSong = song;
-    g.roundEndsAt = Date.now() + 60_000;
-    g.roundRemainingMs = 60_000;
+    const roundDurationMs = g.roundDurationSeconds * 1000;
+    g.roundEndsAt = Date.now() + roundDurationMs;
+    g.roundRemainingMs = roundDurationMs;
+    g.answerEndsAt = undefined;
+    g.revealEndsAt = undefined;
     g.musicPlaying = false;
     const jellyfinUrl = g.provider.getStreamUrl(song);
     if (jellyfinUrl) {
       for (const [ticket, value] of streamTickets) if (value.expiresAt < Date.now()) streamTickets.delete(ticket);
       const ticket = randomBytes(32).toString("hex");
-      streamTickets.set(ticket, { url: jellyfinUrl, expiresAt: g.roundEndsAt });
+      streamTickets.set(ticket, { url: jellyfinUrl, headers: g.provider.getStreamHeaders?.(), expiresAt: g.roundEndsAt });
       g.streamTicket = ticket;
       g.streamUrl = `/api/music/stream/${ticket}`;
     } else { g.streamTicket = undefined; g.streamUrl = undefined; }
     g.answers.clear();
     g.status = "PLAYING";
+    scheduleSongEnd(g, roundDurationMs);
     io.to(g.code).emit("game-state", safeGame(g));
-    socket.emit("host-track", { streamUrl: g.streamUrl, simulated: !g.streamUrl, roundEndsAt: g.roundEndsAt });
+    notifyHostTrack(g);
+  };
+  const revealRound = (g: Game) => {
+    if (g.status !== "PLAYING" && g.status !== "ANSWERING") return;
+    if (g.songTimer) clearTimeout(g.songTimer);
+    g.songTimer = undefined;
+    if (g.answerTimer) clearTimeout(g.answerTimer);
+    g.answerTimer = undefined;
+    clearSongStream(g);
+    g.status = "REVEAL";
+    g.roundEndsAt = undefined;
+    g.roundRemainingMs = undefined;
+    g.answerEndsAt = undefined;
+    const revealDurationMs = g.revealDurationSeconds * 1000;
+    g.revealEndsAt = Date.now() + revealDurationMs;
+    g.musicPlaying = false;
+    io.to(g.code).emit("game-state", safeGame(g, true));
+    g.revealTimer = setTimeout(() => {
+      if (g.status !== "REVEAL") return;
+      g.revealTimer = undefined;
+      g.revealEndsAt = undefined;
+      if (g.round >= g.maxRounds) {
+        g.status = "GAME_OVER";
+        g.playlists = [];
+        clearRoundTimers(g);
+        io.to(g.code).emit("game-state", safeGame(g, true));
+        return;
+      }
+      try {
+        beginRound(g);
+      } catch (error) {
+        g.status = "GAME_OVER";
+        g.playlists = [];
+        clearSongStream(g);
+        io.to(g.code).emit("game-state", safeGame(g, true));
+        io.to(g.code).emit("game-error", { message: (error as Error).message });
+      }
+    }, revealDurationMs);
+  };
+  beginAnswerWindow = (g: Game) => {
+    if (g.status !== "PLAYING") return;
+    if (g.songTimer) clearTimeout(g.songTimer);
+    g.songTimer = undefined;
+    clearSongStream(g);
+    g.status = "ANSWERING";
+    g.roundEndsAt = undefined;
+    g.roundRemainingMs = 0;
+    g.answerEndsAt = Date.now() + 5_000;
+    g.revealEndsAt = undefined;
+    g.musicPlaying = false;
+    io.to(g.code).emit("game-state", safeGame(g));
+    g.answerTimer = setTimeout(() => revealRound(g), 5_000);
   };
   socket.on("library-jellyfin-connect", (_payload: unknown, cb: (x: any) => void) => {
     try { requireLibraryAdmin(); } catch (e) { return cb({ error: (e as Error).message }); }
@@ -596,6 +810,73 @@ io.on("connection", (socket) => {
         })));
       }
       cb({ ok: true, matchedCount: matches.length, ambiguousCount, unmatchedCount: unmatched.length - matches.length - ambiguousCount });
+    } catch (e) { cb({ error: playlistStorageError(e) }); }
+  });
+  socket.on("library-jellyfin-resync-playlist", async (payload: { playlistId?: string }, cb: (x: any) => void) => {
+    try {
+      requireLibraryAdmin();
+      if (!(jellyfinProvider instanceof JellyfinMusicProvider) || !jellyfinReady) throw new Error("Jellyfin is not available on this server.");
+      const playlistId = z.string().min(1).max(100).parse(payload?.playlistId || "");
+      const playlist = await prisma.playlist.findUnique({ where: { id: playlistId }, include: { songs: { include: { song: true } } } });
+      if (!playlist) throw new Error("Playlist not found.");
+
+      const librarySongs = await jellyfinProvider.listAudioSongs();
+      const currentIds = new Set(librarySongs.map((song) => song.providerTrackId).filter((id): id is string => Boolean(id)));
+      const libraryByTitleAndArtist = new Map<string, Song[]>();
+      for (const item of librarySongs) {
+        const key = `${normalizeMatchText(item.title)}|${normalizeMatchText(item.artist)}`;
+        const candidates = libraryByTitleAndArtist.get(key) || [];
+        candidates.push(item);
+        libraryByTitleAndArtist.set(key, candidates);
+      }
+
+      const changes: { songId: string; provider: string; trackId: string | null }[] = [];
+      let validCount = 0;
+      let matchedCount = 0;
+      let staleCount = 0;
+      let ambiguousCount = 0;
+      let unmatchedCount = 0;
+      for (const { song } of playlist.songs) {
+        if (song.provider !== "spotify" && song.provider !== "jellyfin") continue;
+        const existingId = song.provider === "jellyfin" ? song.providerTrackId : song.jellyfinTrackId;
+        if (existingId && currentIds.has(existingId)) {
+          validCount++;
+          continue;
+        }
+        if (existingId) staleCount++;
+
+        const candidates = libraryByTitleAndArtist.get(`${normalizeMatchText(song.title)}|${normalizeMatchText(song.artist)}`) || [];
+        let match = candidates.length === 1 ? candidates[0] : undefined;
+        if (candidates.length > 1) {
+          const album = normalizeMatchText(song.album);
+          const ranked = candidates.map((candidate) => ({
+            candidate,
+            score: (album && normalizeMatchText(candidate.album) === album ? 4 : 0)
+              + (song.releaseYear > 0 && candidate.releaseYear === song.releaseYear ? 2 : 0),
+          }));
+          const bestScore = Math.max(...ranked.map(({ score }) => score));
+          const best = ranked.filter(({ score }) => score === bestScore);
+          if (bestScore > 0 && best.length === 1) match = best[0]?.candidate;
+          if (!match) ambiguousCount++;
+        }
+        if (match?.providerTrackId) matchedCount++;
+        else if (candidates.length === 0) unmatchedCount++;
+
+        const nextId = match?.providerTrackId || null;
+        if (nextId !== existingId) changes.push({ songId: song.id, provider: song.provider, trackId: nextId });
+      }
+
+      if (changes.length) {
+        await prisma.$transaction(async (tx) => {
+          for (const change of changes) {
+            await tx.song.update({
+              where: { id: change.songId },
+              data: change.provider === "jellyfin" ? { providerTrackId: change.trackId } : { jellyfinTrackId: change.trackId },
+            });
+          }
+        });
+      }
+      cb({ ok: true, validCount, matchedCount, staleCount, ambiguousCount, unmatchedCount });
     } catch (e) { cb({ error: playlistStorageError(e) }); }
   });
   const appendLibrarySongs = async (playlistId: string, importedSongs: Song[]) => {
@@ -913,9 +1194,18 @@ io.on("connection", (socket) => {
   socket.on("start-game", (_p: any, cb: (x: any) => void) => {
     try {
       const g = auth(true);
-      if ([...g.players.values()].filter((p) => p.connected).length < 2) throw new Error("Invite at least one player first.");
+      if ([...g.players.values()].filter((p) => p.isPlayer && p.connected).length < 2) throw new Error("Invite at least one player first.");
+      clearRoundTimers(g);
+      clearSongStream(g);
       g.round = 0;
+      g.bonusChallenge = undefined;
       g.status = "LOBBY";
+      g.roundEndsAt = undefined;
+      g.roundRemainingMs = undefined;
+      g.answerEndsAt = undefined;
+      g.revealEndsAt = undefined;
+      g.musicPlaying = false;
+      g.answers.clear();
       io.to(g.code).emit("game-state", safeGame(g));
       cb({ ok: true });
     } catch (e) {
@@ -926,7 +1216,14 @@ io.on("connection", (socket) => {
     try {
       const g = auth(true);
       if (g.round >= g.maxRounds) {
+        clearRoundTimers(g);
+        clearSongStream(g);
         g.status = "GAME_OVER";
+        g.roundEndsAt = undefined;
+        g.roundRemainingMs = undefined;
+        g.answerEndsAt = undefined;
+        g.revealEndsAt = undefined;
+        g.musicPlaying = false;
         io.to(g.code).emit("game-state", safeGame(g));
         return cb({ ok: true });
       }
@@ -939,16 +1236,32 @@ io.on("connection", (socket) => {
   socket.on("set-music-playing", (payload: { playing?: boolean }, cb: (x: any) => void) => {
     try {
       const g = auth(true);
+      if (g.status === "ANSWERING" || g.status === "REVEAL" || g.status === "GAME_OVER") return cb({ ok: true });
       if (g.status !== "PLAYING") throw new Error("There is no active round.");
       const playing = Boolean(payload?.playing);
       if (playing === g.musicPlaying) return cb({ ok: true });
       if (playing) {
         const remaining = g.roundRemainingMs ?? (g.roundEndsAt ? Math.max(0, g.roundEndsAt - Date.now()) : 0);
-        if (remaining <= 0) return cb({ ok: true });
+        if (remaining <= 0) {
+          beginAnswerWindow(g);
+          return cb({ ok: true });
+        }
         g.roundRemainingMs = remaining;
         g.roundEndsAt = Date.now() + remaining;
+        if (g.streamTicket && g.streamUrl) {
+          const ticket = streamTickets.get(g.streamTicket);
+          if (ticket) streamTickets.set(g.streamTicket, { ...ticket, expiresAt: g.roundEndsAt });
+        }
+        scheduleSongEnd(g, remaining);
       } else {
         g.roundRemainingMs = g.roundEndsAt ? Math.max(0, g.roundEndsAt - Date.now()) : (g.roundRemainingMs ?? 0);
+        if (g.roundRemainingMs <= 0) {
+          g.musicPlaying = false;
+          beginAnswerWindow(g);
+          return cb({ ok: true });
+        }
+        if (g.songTimer) clearTimeout(g.songTimer);
+        g.songTimer = undefined;
         g.roundEndsAt = undefined;
       }
       g.musicPlaying = playing;
@@ -956,36 +1269,43 @@ io.on("connection", (socket) => {
       cb({ ok: true });
     } catch (e) { cb({ error: (e as Error).message }); }
   });
+  socket.on("end-song", (_payload: unknown, cb: (x: any) => void) => {
+    try {
+      const g = auth(true);
+      if (g.status === "PLAYING") beginAnswerWindow(g);
+      else if (g.status !== "ANSWERING") throw new Error("There is no active song to end.");
+      cb({ ok: true });
+    } catch (e) { cb({ error: (e as Error).message }); }
+  });
   socket.on("submit-answer", (payload: any, cb: (x: any) => void) => {
     try {
       const g = auth();
-      if (g.status !== "PLAYING") throw new Error("Answers are closed.");
+      const submittingPlayer = g.players.get(identity!.playerId);
+      if (!submittingPlayer?.isPlayer) throw new Error("The host is not playing in this game.");
+      if (g.status === "PLAYING" && g.roundEndsAt && Date.now() >= g.roundEndsAt) beginAnswerWindow(g);
+      if (g.status === "ANSWERING" && g.answerEndsAt && Date.now() >= g.answerEndsAt) revealRound(g);
+      if (g.status !== "PLAYING" && g.status !== "ANSWERING") throw new Error("Answers are closed.");
       if (g.answers.has(identity!.playerId)) throw new Error("You already submitted.");
       const parsed = answerSchema.safeParse(payload);
       if (!parsed.success) throw new Error("Check your answer and try again.");
       const song = g.currentSong!;
-      const remainingTimeMs = g.roundEndsAt
-        ? Math.max(0, g.roundEndsAt - Date.now())
-        : Math.max(0, g.roundRemainingMs ?? 0);
-      const points = scoreAnswer(parsed.data, song, remainingTimeMs);
-      g.answers.set(identity!.playerId, { playerId: identity!.playerId, ...parsed.data, points });
-      g.players.get(identity!.playerId)!.score += points;
+      const remainingTimeMs = g.status === "ANSWERING"
+        ? Math.max(0, (g.answerEndsAt || 0) - Date.now())
+        : g.roundEndsAt
+          ? Math.max(0, g.roundEndsAt - Date.now())
+          : Math.max(0, g.roundRemainingMs ?? 0);
+      const bonusChallenge = Boolean(g.bonusChallenge);
+      if (bonusChallenge && !parsed.data.title) throw new Error("Enter the song title for this bonus challenge.");
+      const answer = bonusChallenge ? { ...parsed.data, artist: "", year: null } : parsed.data;
+      const points = scoreAnswer(answer, song, remainingTimeMs) * (bonusChallenge ? 2 : 1);
+      g.answers.set(identity!.playerId, { playerId: identity!.playerId, ...answer, points });
+      submittingPlayer.score += points;
       cb({ ok: true });
       io.to(g.code).emit("answer-locked", { playerId: identity!.playerId });
-      const everyoneAnswered = [...g.players.values()].filter((p) => p.connected).every((p) => g.answers.has(p.id));
-      if (everyoneAnswered) {
-        g.status = "REVEAL";
-        if (g.streamTicket) streamTickets.delete(g.streamTicket);
-        g.streamTicket = undefined;
-        g.streamUrl = undefined;
-        g.roundEndsAt = undefined;
-        g.roundRemainingMs = undefined;
-        g.musicPlaying = false;
-        io.to(g.code).emit("game-state", safeGame(g, true));
-        io.to(g.code).emit("all-answered");
-      } else {
-        io.to(g.code).emit("game-state", safeGame(g));
-      }
+      const connectedPlayers = [...g.players.values()].filter((player) => player.isPlayer && player.connected);
+      const everyoneAnswered = connectedPlayers.length > 0 && connectedPlayers.every((player) => g.answers.has(player.id));
+      if (everyoneAnswered) revealRound(g);
+      else io.to(g.code).emit("game-state", safeGame(g));
     } catch (e) {
       cb({ error: (e as Error).message });
     }
@@ -994,14 +1314,7 @@ io.on("connection", (socket) => {
     try {
       const g = auth(true);
       if (g.status !== "PLAYING") throw new Error("There is no active round.");
-      g.status = "REVEAL";
-      if (g.streamTicket) streamTickets.delete(g.streamTicket);
-      g.streamTicket = undefined;
-      g.streamUrl = undefined;
-      g.roundEndsAt = undefined;
-      g.roundRemainingMs = undefined;
-      g.musicPlaying = false;
-      io.to(g.code).emit("game-state", safeGame(g, true));
+      beginAnswerWindow(g);
       cb({ ok: true });
     } catch (e) {
       cb({ error: (e as Error).message });
@@ -1011,12 +1324,13 @@ io.on("connection", (socket) => {
     try {
       const g = auth(true);
       if (g.status === "GAME_OVER") throw new Error("This game has already ended.");
+      clearRoundTimers(g);
       g.status = "GAME_OVER";
-      if (g.streamTicket) streamTickets.delete(g.streamTicket);
-      g.streamTicket = undefined;
-      g.streamUrl = undefined;
+      clearSongStream(g);
       g.roundEndsAt = undefined;
       g.roundRemainingMs = undefined;
+      g.answerEndsAt = undefined;
+      g.revealEndsAt = undefined;
       g.musicPlaying = false;
       io.to(g.code).emit("game-state", safeGame(g, Boolean(g.currentSong)));
       cb({ ok: true });
@@ -1025,39 +1339,14 @@ io.on("connection", (socket) => {
   socket.on("next-round", (_p: any, cb: (x: any) => void) => {
     try {
       const g = auth(true);
-      if (g.status !== "REVEAL") throw new Error("Reveal the answer first.");
-      if (g.round >= g.maxRounds) {
-        g.status = "GAME_OVER";
-        g.playlists = [];
-        g.streamUrl = undefined;
-        g.streamTicket = undefined;
-        g.roundEndsAt = undefined;
-        g.roundRemainingMs = undefined;
-        g.musicPlaying = false;
-        io.to(g.code).emit("game-state", safeGame(g, true));
-      } else {
-        beginRound(g);
-      }
-      cb({ ok: true });
+      if (g.status !== "REVEAL") throw new Error("The results are not ready yet.");
+      cb({ ok: true, waiting: true });
     } catch (e) {
       cb({ error: (e as Error).message });
     }
   });
   socket.on("disconnect", () => {
-    if (!identity) return;
-    const g = identity.game,
-      p = g.players.get(identity.playerId);
-    if (p) p.connected = false;
-    io.to(g.code).emit("game-state", safeGame(g));
-    if (![...g.players.values()].some((player) => player.connected))
-      setTimeout(
-        () => {
-          if (![...g.players.values()].some((player) => player.connected)) {
-            games.delete(g.code);
-          }
-        },
-        60 * 60 * 1000,
-      );
+    leaveCurrentGame();
   });
 });
 const port = Number(process.env.PORT) || 3001;

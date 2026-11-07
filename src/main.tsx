@@ -12,7 +12,7 @@ import { GameOverPage } from "./pages/GameOverPage";
 import { GameRevealPage } from "./pages/GameRevealPage";
 import { GameRoundPage } from "./pages/GameRoundPage";
 import { PlaylistManager } from "./pages/PlaylistManager";
-import type { Game, GameResult, Player, SavedPlaylist } from "./types";
+import type { Game, Player, SavedPlaylist } from "./types";
 import "./style.css";
 import "./jellyfin.css";
 import "./game-transitions.css";
@@ -46,6 +46,7 @@ function App() {
     [submitted, setSubmitted] = useState(false),
     [playing, setPlaying] = useState(false),
     [tick, setTick] = useState(60),
+    [musicVolume, setMusicVolume] = useState(1),
     [roundEndsAt, setRoundEndsAt] = useState(0),
     [streamUrl, setStreamUrl] = useState(""),
     [jfConnected, setJfConnected] = useState(false),
@@ -72,11 +73,148 @@ function App() {
     [confirmStop, setConfirmStop] = useState(false),
     [answers, setAnswers] = useState({ title: "", artist: "", year: "" });
   const audioRef = useRef<HTMLAudioElement>(null);
+  const audioFilterGraphRef = useRef(new WeakMap<HTMLAudioElement, {
+    context: AudioContext;
+    source: MediaElementAudioSourceNode;
+    highPass: BiquadFilterNode;
+    lowPass: BiquadFilterNode;
+    gain: GainNode;
+  }>());
+  useEffect(() => {
+    const player = audioRef.current;
+    if (!player) return;
+    const graph = audioFilterGraphRef.current.get(player);
+    if (graph) {
+      player.volume = 1;
+      graph.gain.gain.setTargetAtTime(musicVolume, graph.context.currentTime, 0.015);
+    } else player.volume = musicVolume;
+  }, [musicVolume, streamUrl, game?.status]);
+  useEffect(() => {
+    const player = audioRef.current as (HTMLAudioElement & { preservesPitch?: boolean; mozPreservesPitch?: boolean; webkitPreservesPitch?: boolean }) | null;
+    if (!player) return;
+    const slowChallenge = game?.bonusChallenge === "SLOWED_MUSIC";
+    player.playbackRate = slowChallenge ? 0.7 : 1;
+    if (typeof player.preservesPitch === "boolean") player.preservesPitch = !slowChallenge;
+    if (typeof player.mozPreservesPitch === "boolean") player.mozPreservesPitch = !slowChallenge;
+    if (typeof player.webkitPreservesPitch === "boolean") player.webkitPreservesPitch = !slowChallenge;
+  }, [game?.round, game?.bonusChallenge, streamUrl]);
+  useEffect(() => {
+    const player = audioRef.current;
+    if (!player) return;
+    const telephoneFilter = game?.bonusChallenge === "TELEPHONE_FILTER";
+    let graph = audioFilterGraphRef.current.get(player);
+    if (!graph && telephoneFilter) {
+      try {
+        const context = soundContextRef.current ?? new AudioContext();
+        soundContextRef.current = context;
+        const source = context.createMediaElementSource(player);
+        const highPass = context.createBiquadFilter();
+        highPass.type = "highpass";
+        highPass.frequency.value = 300;
+        const lowPass = context.createBiquadFilter();
+        lowPass.type = "lowpass";
+        lowPass.frequency.value = 3400;
+        const gain = context.createGain();
+        gain.gain.value = player.volume;
+        graph = { context, source, highPass, lowPass, gain };
+        audioFilterGraphRef.current.set(player, graph);
+      } catch {
+        setErr("This browser could not apply the telephone filter to the song.");
+        return;
+      }
+    }
+    if (!graph) return;
+    try {
+      graph.source.disconnect();
+      graph.highPass.disconnect();
+      graph.lowPass.disconnect();
+      graph.gain.disconnect();
+      if (telephoneFilter) {
+        graph.source.connect(graph.highPass);
+        graph.highPass.connect(graph.lowPass);
+        graph.lowPass.connect(graph.gain);
+      } else graph.source.connect(graph.gain);
+      graph.gain.connect(graph.context.destination);
+      player.volume = 1;
+      if (graph.context.state === "suspended") void graph.context.resume().catch(() => {});
+    } catch {
+      setErr("This browser could not apply the telephone filter to the song.");
+    }
+    return () => {
+      graph?.source.disconnect();
+      graph?.highPass.disconnect();
+      graph?.lowPass.disconnect();
+      graph?.gain.disconnect();
+    };
+  }, [game?.round, game?.bonusChallenge, streamUrl]);
+  useEffect(() => {
+    const player = audioRef.current;
+    if (!player || game?.bonusChallenge !== "STUTTERED_MUSIC" || !playing) {
+      if (player) player.muted = false;
+      return;
+    }
+    let audible = true;
+    const interval = window.setInterval(() => {
+      audible = !audible;
+      player.muted = !audible;
+    }, 500);
+    return () => {
+      window.clearInterval(interval);
+      player.muted = false;
+    };
+  }, [game?.round, game?.bonusChallenge, playing, streamUrl]);
+  const getAudioPlaybackError = (error?: unknown) => {
+    const player = audioRef.current;
+    const errorName = error instanceof DOMException ? error.name : "";
+    if (errorName === "NotAllowedError")
+      return "Your browser blocked playback. Tap Play to start the song.";
+    if (errorName === "NotSupportedError" || player?.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)
+      return "Jellyfin returned an audio format this browser cannot play. Check that Jellyfin transcoding is enabled and FFmpeg is working.";
+    if (player?.error?.code === MediaError.MEDIA_ERR_NETWORK)
+      return "The browser could not load the Jellyfin stream. Check that the app server can reach Jellyfin and that the round has not expired.";
+    if (player?.error?.code === MediaError.MEDIA_ERR_DECODE)
+      return "The Jellyfin audio stream could not be decoded. Check the source track and Jellyfin transcoding logs.";
+    return "The Jellyfin stream could not be played. Check the Jellyfin server and transcoding logs.";
+  };
+  const inspectAudioPlaybackError = async (error?: unknown) => {
+    const player = audioRef.current;
+    const unsupported = error instanceof DOMException && error.name === "NotSupportedError"
+      || player?.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED;
+    if (!unsupported || !streamUrl) {
+      setErr(getAudioPlaybackError(error));
+      return;
+    }
+    try {
+      const response = await fetch(streamUrl, { method: "HEAD", cache: "no-store" });
+      const contentType = response.headers.get("content-type");
+      const checkSource = response.headers.get("x-stream-check");
+      if (checkSource === "ticket-expired") {
+        setErr("The app stream ticket expired before playback could be checked. Start a new round and try Play again.");
+        return;
+      }
+      if (checkSource === "upstream-unreachable") {
+        setErr("The app server could not reach Jellyfin to check this track. Check the Jellyfin URL and app server logs.");
+        return;
+      }
+      if (!response.ok) {
+        setErr(checkSource === "jellyfin" && response.status === 404
+          ? "Jellyfin could not find this track (HTTP 404). Check that its saved Jellyfin match belongs to the configured server, then inspect Jellyfin's log for the /Audio/.../universal request."
+          : `Jellyfin rejected the stream check (HTTP ${response.status}). Check the Jellyfin server logs.`);
+      } else if (contentType && !contentType.toLowerCase().startsWith("audio/")) {
+        setErr(`Jellyfin returned ${contentType} instead of audio data (HTTP ${response.status}). Check the Jellyfin server logs and FFmpeg setup.`);
+      } else {
+        setErr(`Jellyfin returned ${contentType || "an unknown content type"} (HTTP ${response.status}), but the browser could not decode it. Check the Jellyfin FFmpeg logs for this track.`);
+      }
+    } catch {
+      setErr("The browser could not load the Jellyfin stream, and the app could not check the server response. Check the Jamster and Jellyfin server logs.");
+    }
+  };
   const soundContextRef = useRef<AudioContext | null>(null);
   const spotifyAutoloadRequestedRef = useRef(false);
+  const lastAnswerBeepRef = useRef<{ round: number; second: number } | null>(null);
   const hostRef = useRef(false);
   const previousRoundStateRef = useRef<{ status: string; round: number } | null>(null);
-  const playGameSound = (cue: "lock-in" | "round-start" | "round-end") => {
+  const playGameSound = (cue: "lock-in" | "round-start" | "round-end" | "countdown") => {
     try {
       const context = soundContextRef.current ?? new AudioContext();
       soundContextRef.current = context;
@@ -85,7 +223,9 @@ function App() {
           ? [[880, 0, 0.11], [1175, 0.09, 0.16]]
           : cue === "round-start"
             ? [[523, 0, 0.16], [659, 0.13, 0.16], [784, 0.26, 0.25]]
-            : [[659, 0, 0.2], [523, 0.17, 0.2], [392, 0.34, 0.32]];
+            : cue === "countdown"
+              ? [[tick === 1 ? 988 : 659, 0, 0.1]]
+              : [[659, 0, 0.2], [523, 0.17, 0.2], [392, 0.34, 0.32]];
         for (const [frequency, offset, duration] of notes) {
           const oscillator = context.createOscillator();
           const gain = context.createGain();
@@ -105,6 +245,23 @@ function App() {
       /* Audio is optional when the browser does not support Web Audio. */
     }
   };
+  useEffect(() => {
+    const unlockAudio = () => {
+      try {
+        const context = soundContextRef.current ?? new AudioContext();
+        soundContextRef.current = context;
+        void context.resume();
+      } catch {
+        /* Countdown sounds are optional when Web Audio is unavailable. */
+      }
+    };
+    window.addEventListener("pointerdown", unlockAudio, { once: true });
+    window.addEventListener("keydown", unlockAudio, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio);
+      window.removeEventListener("keydown", unlockAudio);
+    };
+  }, []);
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (!spotifyCallbackOrigin || event.origin !== spotifyCallbackOrigin || event.data?.type !== "spotify-auth-complete") return;
@@ -165,7 +322,7 @@ function App() {
       const previous = previousRoundStateRef.current;
       if (hostRef.current && previous) {
         if (g.status === "PLAYING" && (previous.status !== "PLAYING" || previous.round !== g.round)) playGameSound("round-start");
-        else if (previous.status === "PLAYING" && (g.status === "REVEAL" || g.status === "GAME_OVER")) playGameSound("round-end");
+        else if (previous.status === "PLAYING" && g.status === "ANSWERING") playGameSound("round-end");
       }
       previousRoundStateRef.current = { status: g.status, round: g.round };
       setGame(g);
@@ -173,10 +330,14 @@ function App() {
       setPlaying(g.musicPlaying);
       setRoundEndsAt(g.roundEndsAt || 0);
       if (g.roundEndsAt) setTick(Math.max(0, Math.ceil((g.roundEndsAt - Date.now()) / 1000)));
+      else if (g.status === "ANSWERING" && g.answerEndsAt)
+        setTick(Math.max(0, Math.ceil((g.answerEndsAt - Date.now()) / 1000)));
+      else if (g.status === "REVEAL" && g.revealEndsAt)
+        setTick(Math.max(0, Math.ceil((g.revealEndsAt - Date.now()) / 1000)));
       else if (g.status === "PLAYING" && g.roundTimeRemainingMs !== undefined)
         setTick(Math.max(0, Math.ceil(g.roundTimeRemainingMs / 1000)));
-      setSubmitted(g.status === "PLAYING" && Boolean(me) && g.answeredPlayers?.includes(me));
-      if (g.status === "REVEAL" || g.status === "GAME_OVER") {
+      setSubmitted((g.status === "PLAYING" || g.status === "ANSWERING") && Boolean(me) && g.answeredPlayers?.includes(me));
+      if (g.status === "ANSWERING" || g.status === "REVEAL" || g.status === "GAME_OVER") {
         setPlaying(false);
         setStreamUrl("");
         audioRef.current?.pause();
@@ -189,9 +350,11 @@ function App() {
       setRoundEndsAt(track.roundEndsAt || 0);
       if (track.roundEndsAt) setTick(Math.max(0, Math.ceil((track.roundEndsAt - Date.now()) / 1000)));
     });
-    socket.on("all-answered", () => {});
     socket.on("answer-locked", () => {
       if (hostRef.current) playGameSound("lock-in");
+    });
+    socket.on("game-error", (result: { message?: string }) => {
+      setErr(result.message || "The next round could not start.");
     });
     if (saved?.code && saved?.playerId && saved?.playerToken) {
       socket.emit("join-game", { code: saved.code, playerId: saved.playerId, playerToken: saved.playerToken, name: saved.name || "Player" }, (res: any) => {
@@ -209,6 +372,7 @@ function App() {
       socket.off("game-state");
       socket.off("host-track");
       socket.off("answer-locked");
+      socket.off("game-error");
       socket.off("disconnect", onDisconnect);
       socket.off("connect", onConnect);
       socket.disconnect();
@@ -227,10 +391,10 @@ function App() {
           setErr("");
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (active) {
           setPlaying(false);
-          setErr("Your browser blocked automatic playback. Tap Play once to start the song.");
+          void inspectAudioPlaybackError(error);
         }
       });
     return () => {
@@ -238,11 +402,19 @@ function App() {
     };
   }, [host, game?.status, streamUrl, tick <= 0]);
   useEffect(() => {
-    if (game?.status !== "PLAYING" || !roundEndsAt) return;
+    const phase = game?.status;
+    const deadline = phase === "PLAYING"
+      ? roundEndsAt
+      : phase === "ANSWERING"
+        ? game?.answerEndsAt || 0
+        : phase === "REVEAL"
+          ? game?.revealEndsAt || 0
+          : 0;
+    if (!deadline) return;
     const refresh = () => {
-      const remaining = Math.max(0, Math.ceil((roundEndsAt - Date.now()) / 1000));
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
       setTick(remaining);
-      if (remaining === 0 && host) {
+      if (phase === "PLAYING" && remaining === 0 && host) {
         audioRef.current?.pause();
         setPlaying(false);
       }
@@ -250,7 +422,14 @@ function App() {
     refresh();
     const t = setInterval(refresh, 200);
     return () => clearInterval(t);
-  }, [host, game?.status, roundEndsAt]);
+  }, [host, game?.status, game?.answerEndsAt, game?.revealEndsAt, roundEndsAt]);
+  useEffect(() => {
+    if (game?.status !== "ANSWERING" || tick <= 0) return;
+    const previous = lastAnswerBeepRef.current;
+    if (previous?.round === game.round && previous.second === tick) return;
+    lastAnswerBeepRef.current = { round: game.round, second: tick };
+    playGameSound("countdown");
+  }, [game?.status, game?.round, tick]);
   const remember = (g: Game, id: string, playerToken: string, isHost: boolean, n: string) => {
     hostRef.current = isHost;
     setGame(g);
@@ -344,8 +523,43 @@ function App() {
     if (r?.error) setErr(r.error);
     else setErr("");
   };
+  const joinAnotherGame = () => {
+    socket.emit("leave-game");
+    localStorage.removeItem("sidea-session");
+    hostRef.current = false;
+    setGame(null);
+    setMe("");
+    setHost(false);
+    setSubmitted(false);
+    setPlaying(false);
+    setStreamUrl("");
+    setAnswers({ title: "", artist: "", year: "" });
+    setCode("");
+    setErr("");
+    setScreen("guest-login");
+  };
   const setRoundCount = async (count: number) => {
     const r = await emit("set-round-count", { count });
+    if (r?.error) setErr(r.error);
+    else setErr("");
+  };
+  const setRoundDuration = async (seconds: number) => {
+    const r = await emit("set-round-duration", { seconds });
+    if (r?.error) setErr(r.error);
+    else setErr("");
+  };
+  const setRevealDuration = async (seconds: number) => {
+    const r = await emit("set-reveal-duration", { seconds });
+    if (r?.error) setErr(r.error);
+    else setErr("");
+  };
+  const setBonusRounds = async (enabled: boolean) => {
+    const r = await emit("set-bonus-rounds", { enabled });
+    if (r?.error) setErr(r.error);
+    else setErr("");
+  };
+  const setHostParticipation = async (enabled: boolean) => {
+    const r = await emit("set-host-participation", { enabled });
     if (r?.error) setErr(r.error);
     else setErr("");
   };
@@ -434,6 +648,21 @@ function App() {
     if (result?.error) setErr(result.error);
     else {
       setJfAutoMatchNotice(`Matched ${result.matchedCount} tracks. ${result.ambiguousCount} need review; ${result.unmatchedCount} had no exact match.`);
+      await refreshSavedPlaylists(playlistId);
+    }
+  };
+  const resyncPlaylistTracks = async (playlistId: string) => {
+    setJfBusy(true);
+    setErr("");
+    setJfAutoMatchNotice("");
+    const connection = await emit("library-jellyfin-connect", {});
+    if (connection?.error) { setJfBusy(false); setErr(connection.error); return; }
+    setJfConnected(true);
+    const result = await emit("library-jellyfin-resync-playlist", { playlistId });
+    setJfBusy(false);
+    if (result?.error) setErr(result.error);
+    else {
+      setJfAutoMatchNotice(`Resync complete: ${result.validCount} tracks still match, ${result.matchedCount} links repaired, ${result.staleCount} stale links found, ${result.ambiguousCount} need review, and ${result.unmatchedCount} have no match.`);
       await refreshSavedPlaylists(playlistId);
     }
   };
@@ -531,7 +760,7 @@ function App() {
         void player
           .play()
           .then(() => emit("set-music-playing", { playing: true }))
-          .catch(() => setErr("The host browser could not play this Jellyfin stream."));
+          .catch((error: unknown) => { void inspectAudioPlaybackError(error); });
       else {
         player.pause();
         void emit("set-music-playing", { playing: false });
@@ -544,6 +773,10 @@ function App() {
   };
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!answers.title.trim() && !answers.artist.trim() && !answers.year.trim()) {
+      setErr("Enter at least a title, artist, or year.");
+      return;
+    }
     const r = await emit("submit-answer", {
       title: answers.title,
       artist: answers.artist,
@@ -552,6 +785,7 @@ function App() {
     if (r?.error) setErr(r.error);
     else {
       setSubmitted(true);
+      setAnswers({ title: "", artist: "", year: "" });
       setErr("");
     }
   };
@@ -595,6 +829,7 @@ function App() {
         jfBusy={jfBusy}
         autoMatchNotice={jfAutoMatchNotice}
         onAutoMatch={autoMatchSpotifyTracks}
+        onResyncTracks={resyncPlaylistTracks}
         matchingSong={matchingSpotifySong}
         onFindJellyfinMatch={findSpotifySongInJellyfin}
         onCloseMatch={() => setMatchingSpotifySong(null)}
@@ -628,18 +863,19 @@ function App() {
   const answered = game.answered || 0;
   const participants = game.players.filter((player) => player.connected);
   const lockedPlayers = game.players.filter((player) => game.answeredPlayers?.includes(player.id));
-  const myResult: GameResult | undefined = game.results?.find((result) => result.playerId === me);
   return <GameLayout game={game} host={host} confirmStop={confirmStop} setConfirmStop={setConfirmStop} onStop={() => void act("stop-game")}>
     {host && !adminAuthenticated && <AdminReauthPanel password={adminPassword} setPassword={setAdminPassword} busy={adminBusy} error={err} onLogin={() => void authenticateAdmin()} />}
     <div key={`${game.status}-${game.round}`} className="game-page-transition">
-      {game.status === "LOBBY" && <GameLobbyPage game={game} host={host} error={err} joinLink={link} onSelectPlaylist={selectPlaylist} onSetRoundCount={setRoundCount} onStartRound={() => void act("start-round")} />}
-      {game.status === "PLAYING" && <GameRoundPage game={game} host={host} error={err} playing={playing} tick={tick} streamUrl={streamUrl} audioRef={audioRef}
+      {game.status === "LOBBY" && <GameLobbyPage game={game} host={host} error={err} joinLink={link} onSelectPlaylist={selectPlaylist} onSetRoundCount={setRoundCount} onSetRoundDuration={setRoundDuration} onSetRevealDuration={setRevealDuration} onSetBonusRounds={setBonusRounds} onSetHostParticipation={setHostParticipation} onStartRound={() => void act("start-round")} />}
+      {(game.status === "PLAYING" || game.status === "ANSWERING") && <GameRoundPage game={game} host={host} error={err} playing={playing} tick={tick} streamUrl={streamUrl} audioRef={audioRef} musicVolume={musicVolume} onVolumeChange={setMusicVolume}
         onAudioPlay={() => { setPlaying(true); void emit("set-music-playing", { playing: true }); }}
         onAudioPause={() => { setPlaying(false); void emit("set-music-playing", { playing: false }); }}
-        onToggleMusic={toggleMusic} onReveal={() => void act("reveal")} onSubmit={submit} answers={answers} setAnswers={setAnswers}
+        onAudioEnded={() => { setPlaying(false); void emit("end-song"); }}
+        onAudioError={() => { void inspectAudioPlaybackError(); }}
+        onToggleMusic={toggleMusic} onSubmit={submit} answers={answers} setAnswers={setAnswers}
         hasSubmitted={hasSubmitted} answered={answered} participants={participants} lockedPlayers={lockedPlayers} />}
-      {game.status === "REVEAL" && <GameRevealPage game={game} sorted={sorted} myResult={myResult} host={host} onNextRound={() => void act("next-round")} />}
-      {game.status === "GAME_OVER" && <GameOverPage sorted={sorted} host={host} onNewGame={() => void create()} />}
+      {game.status === "REVEAL" && <GameRevealPage game={game} sorted={sorted} tick={tick} />}
+      {game.status === "GAME_OVER" && <GameOverPage sorted={sorted} host={host} error={err} onNewGame={() => void create()} onJoinAnotherGame={joinAnotherGame} />}
     </div>
   </GameLayout>;
 }

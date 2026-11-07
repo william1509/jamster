@@ -17,6 +17,7 @@ export type PlaylistManagerProps = {
   jfBusy: boolean;
   autoMatchNotice: string;
   onAutoMatch: (playlistId: string) => void;
+  onResyncTracks: (playlistId: string) => void;
   matchingSong: SavedPlaylist["songs"][number] | null;
   onFindJellyfinMatch: (song: SavedPlaylist["songs"][number]) => void;
   onCloseMatch: () => void;
@@ -48,6 +49,7 @@ export type PlaylistManagerProps = {
 export function PlaylistManager(props: PlaylistManagerProps) {
   const selected = props.playlists.find((playlist) => playlist.id === props.managedPlaylistId);
   const unmatchedSpotifyCount = selected?.songs.filter((song) => song.provider === "spotify" && !song.jellyfinTrackId).length || 0;
+  const resyncableTrackCount = selected?.songs.filter((song) => song.provider === "spotify" || song.provider === "jellyfin").length || 0;
   const [trackSearch, setTrackSearch] = React.useState("");
   const [trackPage, setTrackPage] = React.useState(1);
   const tracksPerPage = 10;
@@ -83,6 +85,7 @@ export function PlaylistManager(props: PlaylistManagerProps) {
           <button className="secondary">SAVE NAME</button>
           <button className="stop-game" type="button" onClick={() => { if (window.confirm(`Delete ${selected.name} and its items?`)) props.onManagePlaylist("delete-playlist", { id: selected.id }); }}>DELETE</button>
         </form>
+        {resyncableTrackCount > 0 && <button className="secondary jf-auto-match" type="button" disabled={props.jfBusy} onClick={() => props.onResyncTracks(selected.id)}>{props.jfBusy ? "SCANNING JELLYFIN..." : "RESYNC JELLYFIN TRACKS"}</button>}
         {unmatchedSpotifyCount > 0 && <button className="secondary jf-auto-match" type="button" disabled={props.jfBusy} onClick={() => props.onAutoMatch(selected.id)}>{props.jfBusy ? "SCANNING JELLYFIN..." : `AUTO-MATCH ${unmatchedSpotifyCount} TRACKS`}</button>}
         {props.autoMatchNotice && <div className="jf-count">{props.autoMatchNotice}</div>}
         <div className="playlist-manager-tracks">

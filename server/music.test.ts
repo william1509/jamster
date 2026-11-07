@@ -22,7 +22,15 @@ describe("JellyfinMusicProvider", () => {
     expect(songs[0]).toMatchObject({ title: "Dreams", artist: "Fleetwood Mac", releaseYear: 1977, provider: "jellyfin" });
     expect(fetchMock.mock.calls[1][0]).toContain("IncludeItemTypes=Audio");
     expect(fetchMock.mock.calls[1][1]?.headers).toMatchObject({ Authorization: expect.stringContaining('Token="test-token"') });
-    expect(provider.getStreamUrl(songs[0]!)).toBe("https://jellyfin.example/media/Audio/item-1/stream?api_key=test-token");
+    const streamUrl = new URL(provider.getStreamUrl(songs[0]!)!);
+    expect(streamUrl.origin + streamUrl.pathname).toBe("https://jellyfin.example/media/Audio/item-1/universal");
+    expect(Object.fromEntries(streamUrl.searchParams.entries())).toMatchObject({
+      UserId: "user-1", DeviceId: "jamster-host", Container: "mp3", AudioCodec: "mp3",
+      TranscodingContainer: "mp3", TranscodingProtocol: "http", MaxStreamingBitrate: "192000",
+      EnableRedirection: "false",
+    });
+    expect(streamUrl.searchParams.has("api_key")).toBe(false);
+    expect(provider.getStreamHeaders()).toMatchObject({ Authorization: expect.stringContaining('Token="test-token"') });
   });
 
   it("rejects non-http server URLs", () => {

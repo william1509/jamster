@@ -16,6 +16,7 @@ export interface MusicProvider {
   searchSongs(query: string): Promise<Song[]>;
   getSong(id: string): Promise<Song>;
   getStreamUrl(song: Song): string | undefined;
+  getStreamHeaders?(): Record<string, string>;
   dispose?(): void;
 }
 
@@ -39,7 +40,7 @@ type JellyfinItem = {
 type JellyfinAuth = { AccessToken: string; User: { Id: string } };
 type JellyfinPlaylistItem = { Id: string; Name: string; ChildCount?: number };
 
-/** Looks up Jellyfin metadata; the host browser streams the selected item directly from Jellyfin. */
+/** Looks up Jellyfin metadata and builds a browser-compatible host playback URL. */
 export class JellyfinMusicProvider implements MusicProvider {
   private token = "";
   private userId = "";
@@ -160,10 +161,20 @@ export class JellyfinMusicProvider implements MusicProvider {
   getStreamUrl(song: Song) {
     const itemId = song.jellyfinTrackId || (song.provider === "jellyfin" ? song.providerTrackId : undefined);
     if (!itemId) return undefined;
-    const url = new URL(`${this.baseUrl}/Audio/${encodeURIComponent(itemId)}/stream`);
-    // HTML media elements cannot set auth headers; Jellyfin accepts its API token as api_key.
-    url.searchParams.set("api_key", this.token);
+    const url = new URL(`${this.baseUrl}/Audio/${encodeURIComponent(itemId)}/universal`);
+    // Ask Jellyfin to direct-play or transcode into MP3, supported by browser audio elements.
+    url.searchParams.set("UserId", this.userId);
+    url.searchParams.set("DeviceId", "jamster-host");
+    url.searchParams.set("Container", "mp3");
+    url.searchParams.set("AudioCodec", "mp3");
+    url.searchParams.set("TranscodingContainer", "mp3");
+    url.searchParams.set("TranscodingProtocol", "http");
+    url.searchParams.set("MaxStreamingBitrate", "192000");
+    url.searchParams.set("EnableRedirection", "false");
     return url.toString();
+  }
+  getStreamHeaders() {
+    return { Authorization: this.headers().Authorization };
   }
   dispose() { this.token = ""; this.userId = ""; this.catalog.clear(); }
 }

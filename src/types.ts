@@ -17,14 +17,23 @@ export type SavedPlaylist = {
 export type Game = {
   code: string;
   status: string;
+  hostName: string;
+  hostPlayerId?: string;
+  hostIsPlayer: boolean;
   round: number;
   maxRounds: number;
+  roundDurationSeconds: number;
+  revealDurationSeconds: number;
+  bonusRoundsEnabled: boolean;
+  bonusChallenge?: "SLOWED_MUSIC" | "STUTTERED_MUSIC" | "TELEPHONE_FILTER";
   players: Player[];
   answered: number;
   answeredPlayers: string[];
   playlists: { id: string; name: string; trackCount: number; jellyfinTrackCount?: number }[];
   selectedPlaylistId: string;
   roundEndsAt?: number;
+  answerEndsAt?: number;
+  revealEndsAt?: number;
   roundTimeRemainingMs?: number;
   musicPlaying: boolean;
   musicSource: "MOCK" | "JELLYFIN";
