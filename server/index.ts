@@ -6,7 +6,7 @@ import { isIP } from "node:net";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Server } from "socket.io";
-import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { JellyfinMusicProvider, MockMusicProvider, type MusicProvider, type Song } from "./music";
@@ -53,21 +53,8 @@ const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 type SpotifyTokens = { accessToken: string; refreshToken: string; expiresAt: number };
 const spotifyTokens = new Map<string, SpotifyTokens>();
 const libraryAdminId = "library-admin";
-const passwordHash = (password: string, salt: string) => new Promise<Buffer>((resolve, reject) => {
-  scrypt(password, salt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, key) => {
-    if (error) reject(error);
-    else resolve(key as Buffer);
-  });
-});
 const adminPasswordSchema = z.string().min(12).max(128);
-const adminSetupSecret = process.env.ADMIN_SETUP_SECRET || "";
 const configuredAdminPassword = process.env.ADMIN_PASSWORD || "";
-const adminSetupSecretMatches = (candidate: unknown) => {
-  if (adminSetupSecret.length < 32 || typeof candidate !== "string") return false;
-  const expected = Buffer.from(adminSetupSecret);
-  const provided = Buffer.from(candidate);
-  return expected.length === provided.length && timingSafeEqual(expected, provided);
-};
 const spotifyAuthStates = new Map<string, { verifier: string; hostId: string; origin: string; expiresAt: number }>();
 const spotifyClientId = process.env.SPOTIFY_CLIENT_ID || "";
 const spotifyRedirectUri = process.env.SPOTIFY_REDIRECT_URI || `http://localhost:${process.env.PORT || 3001}/api/spotify/callback`;
@@ -169,7 +156,10 @@ const app = express();
 app.disable("x-powered-by");
 app.use(helmet({
   crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
-  contentSecurityPolicy: { directives: { "style-src": ["'self'", "'unsafe-inline'"] } },
+  contentSecurityPolicy: { directives: {
+    "style-src": ["'self'", "'unsafe-inline'"],
+    "upgrade-insecure-requests": null,
+  } },
 }));
 app.use(express.json({ limit: "32kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -403,47 +393,18 @@ io.on("connection", (socket) => {
   const allowAdminAuthAttempt = () => {
     return incrementLimit(adminAuthAttemptsByAddress, clientAddress(socket), 10);
   };
-  socket.on("admin-setup-status", async (_payload: unknown, cb: (x: any) => void) => {
-    try { cb({ setupRequired: !(await prisma.adminAccount.findUnique({ where: { id: "primary" } })), setupEnabled: adminSetupSecret.length >= 32 }); }
-    catch { cb({ error: "Could not check admin account setup." }); }
-  });
-  socket.on("admin-create", async (payload: { password?: string; setupSecret?: string }, cb: (x: any) => void) => {
+  socket.on("admin-login", (payload: { password?: string }, cb: (x: any) => void) => {
     if (!allowAdminAuthAttempt()) return cb({ error: "Too many admin attempts. Wait a minute and try again." });
-    if (!adminSetupSecretMatches(payload?.setupSecret)) return cb({ error: "Admin setup is disabled or the one-time setup secret is incorrect." });
-    const password = adminPasswordSchema.safeParse(payload?.password);
-    if (!password.success) return cb({ error: "Use an admin password of at least 12 characters." });
-    try {
-      if (await prisma.adminAccount.findUnique({ where: { id: "primary" } }))
-        return cb({ error: "Admin setup is already complete. Log in instead." });
-      const salt = randomBytes(16).toString("hex");
-      const hash = await passwordHash(password.data, salt);
-      await prisma.adminAccount.create({ data: { id: "primary", passwordHash: hash.toString("hex"), passwordSalt: salt } });
-      adminAuthenticated = true;
-      cb({ ok: true, sessionToken: issueAdminSession() });
-    } catch (error) {
-      if ((error as { code?: string }).code === "P2002") return cb({ error: "Admin setup was just completed. Log in instead." });
-      cb({ error: "Could not create the admin account." });
-    }
-  });
-  socket.on("admin-login", async (payload: { password?: string }, cb: (x: any) => void) => {
-    if (!allowAdminAuthAttempt()) return cb({ error: "Too many admin attempts. Wait a minute and try again." });
+    if (configuredAdminPassword.length < 12 || configuredAdminPassword.length > 128)
+      return cb({ error: "Admin login is disabled. Configure ADMIN_PASSWORD with 12 to 128 characters on the server." });
     const password = adminPasswordSchema.safeParse(payload?.password);
     if (!password.success) return cb({ error: "Invalid admin password." });
-    try {
-      const account = await prisma.adminAccount.findUnique({ where: { id: "primary" } });
-      if (!account) return cb({ error: "Invalid admin password." });
-      const passwordMatches = configuredAdminPassword.length >= 12
-        ? (() => {
-          const expected = Buffer.from(configuredAdminPassword);
-          const provided = Buffer.from(password.data);
-          return expected.length === provided.length && timingSafeEqual(expected, provided);
-        })()
-        : timingSafeEqual(await passwordHash(password.data, account.passwordSalt), Buffer.from(account.passwordHash, "hex"));
-      if (!passwordMatches)
-        return cb({ error: "Invalid admin password." });
-      adminAuthenticated = true;
-      cb({ ok: true, sessionToken: issueAdminSession() });
-    } catch { cb({ error: "Could not verify the admin account." }); }
+    const expected = Buffer.from(configuredAdminPassword);
+    const provided = Buffer.from(password.data);
+    if (expected.length !== provided.length || !timingSafeEqual(expected, provided))
+      return cb({ error: "Invalid admin password." });
+    adminAuthenticated = true;
+    cb({ ok: true, sessionToken: issueAdminSession() });
   });
   socket.on("admin-resume", (payload: { sessionToken?: string }, cb: (x: any) => void) => {
     const token = typeof payload?.sessionToken === "string" ? payload.sessionToken : "";

@@ -29,11 +29,8 @@ function App() {
     }
     return id;
   });
-  const [adminSetupRequired, setAdminSetupRequired] = useState<boolean | null>(null);
-  const [adminSetupEnabled, setAdminSetupEnabled] = useState(false);
   const [adminAuthenticated, setAdminAuthenticated] = useState(false);
   const [adminPassword, setAdminPassword] = useState("");
-  const [adminSetupSecret, setAdminSetupSecret] = useState("");
   const [adminBusy, setAdminBusy] = useState(false);
   const [screen, setScreen] = useState<"landing" | "admin-login" | "admin-dashboard" | "guest-login">(() =>
     location.pathname.match(/^\/join\/[A-Za-z0-9]{6}\/?$/) ? "guest-login" : "landing");
@@ -308,11 +305,6 @@ function App() {
     };
     socket.on("connect", onConnect);
     socket.connect();
-    socket.emit("admin-setup-status", {}, (result: any) => {
-      if (typeof result?.setupRequired === "boolean") setAdminSetupRequired(result.setupRequired);
-      if (typeof result?.setupEnabled === "boolean") setAdminSetupEnabled(result.setupEnabled);
-      else if (result?.error) setErr(result.error);
-    });
     const onDisconnect = () => {
       setAdminAuthenticated(false);
       setScreen((current) => current === "admin-dashboard" ? "admin-login" : current);
@@ -443,29 +435,12 @@ function App() {
   const authenticateAdmin = async () => {
     setErr("");
     setAdminBusy(true);
-    let setupRequired = adminSetupRequired;
-    if (setupRequired === null) {
-      const status = await emit("admin-setup-status");
-      if (typeof status?.setupRequired !== "boolean") {
-        setAdminBusy(false);
-        setErr(status?.error || "Could not check admin account setup.");
-        return false;
-      }
-      setupRequired = status.setupRequired;
-      setAdminSetupRequired(setupRequired);
-      setAdminSetupEnabled(Boolean(status.setupEnabled));
-    }
-    const result = await emit(setupRequired ? "admin-create" : "admin-login", {
-      password: adminPassword,
-      ...(setupRequired ? { setupSecret: adminSetupSecret } : {}),
-    });
+    const result = await emit("admin-login", { password: adminPassword });
     setAdminBusy(false);
     if (result?.error) { setErr(result.error); return false; }
     setAdminAuthenticated(true);
     if (result?.sessionToken) localStorage.setItem("sidea-admin-session", result.sessionToken);
-    setAdminSetupRequired(false);
     setAdminPassword("");
-    setAdminSetupSecret("");
     setScreen("admin-dashboard");
     void refreshSavedPlaylists();
     void emit("spotify-status", { libraryId }).then((status) => setSpotifyConnected(Boolean(status?.connected)));
@@ -794,12 +769,8 @@ function App() {
   if (!game) {
     if (screen === "landing") return <LandingPage onAdmin={() => { setErr(""); setScreen(adminAuthenticated ? "admin-dashboard" : "admin-login"); }} onGuest={() => { setErr(""); setScreen("guest-login"); }} />;
     if (screen === "admin-login") return <AdminLoginPage
-      setupRequired={adminSetupRequired}
-      setupEnabled={adminSetupEnabled}
       password={adminPassword}
       setPassword={setAdminPassword}
-      setupSecret={adminSetupSecret}
-      setSetupSecret={setAdminSetupSecret}
       busy={adminBusy}
       error={err}
       onSubmit={() => void authenticateAdmin()}
